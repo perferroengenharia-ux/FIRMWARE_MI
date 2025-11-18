@@ -1,0 +1,5 @@
+../Core/Src/perifericos.c:92:6:perifericos_read_buttons	11
+../Core/Src/perifericos.c:116:6:perifericos_set	10
+../Core/Src/perifericos.c:177:9:sensor_read	3
+../Core/Src/perifericos.c:204:6:perifericos_tick	6
+../Core/Src/perifericos.c:214:6:perifericos_task	88

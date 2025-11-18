@@ -1,0 +1,10 @@
+BOMBA  	     -> PB0 -> D10 (ESQUERDA DA PLACA)
+MOTOR  	     -> PB1 -> A3
+SWING  	     -> PB2 -> D10 (DIREITA DA PLACA)
+DRENO	     -> PB3 -> D3
+SENSOR 	     -> PA1 -> A1
+ONOFF_BTN    -> PA0 -> A0
+BOMBA_BTN    -> PB4 -> D5
+SWING_BTN    -> PB5 -> D6
+DRENO_BTN    -> PB6 -> D1
+EXAUSTOR_BTN -> PB7 -> D0
