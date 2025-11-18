@@ -19,6 +19,7 @@
   * 	SWING:		OutPut Push Pull, PullDown
   * 	DRENO:		OutPut Push Pull, PullDown
   * 	SENSOR:		Input, PullDown Aqui----->>>>>
+  * 	Segunda mudança ---------------------------------------------------------->>>>>>>
   ******************************************************************************
   */
 /* USER CODE END Header */
