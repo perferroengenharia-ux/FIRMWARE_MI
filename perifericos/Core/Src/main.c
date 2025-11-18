@@ -18,7 +18,7 @@
   * 	BOMBA:		OutPut Push Pull, PullDown
   * 	SWING:		OutPut Push Pull, PullDown
   * 	DRENO:		OutPut Push Pull, PullDown
-  * 	SENSOR:		Input, PullDown
+  * 	SENSOR:		Input, PullDown Aqui----->>>>>
   ******************************************************************************
   */
 /* USER CODE END Header */
