@@ -551,7 +551,7 @@ void perifericos_task (void)
         // Agora inverter sentido
         motor_sentido = !P51;
 
-        ts = P31 * 60;
+        ts = P31 * 60; //---> atualizado
         // Liga motor no sentido invertido
         HAL_GPIO_WritePin(MOTOR_GPIO_Port, MOTOR_Pin, ligar_motor);
 
