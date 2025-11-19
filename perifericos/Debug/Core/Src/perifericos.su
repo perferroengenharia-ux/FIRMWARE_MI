@@ -1,5 +1,5 @@
-../Core/Src/perifericos.c:92:6:perifericos_read_buttons	16	static
-../Core/Src/perifericos.c:116:6:perifericos_set	8	static
-../Core/Src/perifericos.c:177:9:sensor_read	24	static
-../Core/Src/perifericos.c:204:6:perifericos_tick	8	static
-../Core/Src/perifericos.c:214:6:perifericos_task	24	static
+../Core/Src/perifericos.c:93:6:perifericos_read_buttons	16	static
+../Core/Src/perifericos.c:117:6:perifericos_set	8	static
+../Core/Src/perifericos.c:179:9:sensor_read	24	static
+../Core/Src/perifericos.c:206:6:perifericos_tick	8	static
+../Core/Src/perifericos.c:216:6:perifericos_task	24	static

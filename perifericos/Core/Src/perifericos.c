@@ -9,7 +9,7 @@
  *      P30 - OK
  *      P31 - OK
  *      P32 - OK
- *      P33 -
+ *      P33 - OK
  *      P80 - OK
  *      P81 - OK
  *      P82 - OK
@@ -75,6 +75,7 @@ volatile bool ligar_dreno;
 volatile bool desligar_dreno;
 volatile bool ligar_motor;
 volatile bool desligar_motor;
+volatile bool off_time;
 
 volatile bool flag_onoff 		= false;
 volatile bool flag_bomba 		= false;
@@ -117,6 +118,7 @@ void perifericos_set (void){
 
 	ligar_motor 	= true;
 	desligar_motor = false;
+	off_time = false;
 
 	/*====================DRENO===============*/
 	if (P80 == 0)
@@ -316,11 +318,14 @@ void perifericos_task (void)
             {
                 if (sensor_read() == 1)
                 {
-                    // Nível OK → inicia ciclo molhado
+                	// Nível OK → inicia ciclo molhado
                     HAL_GPIO_WritePin(BOMBA_GPIO_Port, BOMBA_Pin, ligar_bomba);
 
                     tm = P30 * 60; // tempo molhado
+                    off_time = false;
+
                     estado_atual = BOMBA_ON;
+
                 }
                 else
                 {
@@ -358,6 +363,11 @@ void perifericos_task (void)
             flag_onoff = false;
             estado_atual = OFF;
             break;
+        }
+        if (off_time)
+                {
+                    tm = 0;
+                    off_time = false;
         }
 
         // 2) Controle da bomba pelo sensor
@@ -503,6 +513,7 @@ void perifericos_task (void)
             }
             else
             {
+
                 // Ainda tem água no painel -> faz secagem com ts
                 ts = P31 * 60;
 
@@ -560,6 +571,11 @@ void perifericos_task (void)
         break;
 
     case EXAUSTAO_SECAR:
+    	if (off_time)
+    	        {
+    	            ts = 0;
+    	            off_time = false;
+    	        }
 
         // Secagem com sentido invertido
         if (ts > 0)
@@ -587,6 +603,11 @@ void perifericos_task (void)
     	if (flag_onoff) flag_onoff = false;
         // Garante bomba OFF durante toda a secagem
         HAL_GPIO_WritePin(BOMBA_GPIO_Port, BOMBA_Pin, desligar_bomba);
+        if (off_time)
+                {
+                    ts = 0;
+                    off_time = false;
+                }
 
         // Enquanto ts > 0, mantém o motor ligado para secar o painel
         if (ts > 0)

@@ -60,8 +60,8 @@ all: main-build
 main-build: perifericos.elf secondary-outputs
 
 # Tool invocations
-perifericos.elf perifericos.map: $(OBJS) $(USER_OBJS) C:\Users\muril\STM32CubeIDE\workspace_1.19.0\perifericos\STM32C031C6TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "perifericos.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0plus -T"C:\Users\muril\STM32CubeIDE\workspace_1.19.0\perifericos\STM32C031C6TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="perifericos.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+perifericos.elf perifericos.map: $(OBJS) $(USER_OBJS) C:\Users\muril\git\FIRMWARE_MI\perifericos\STM32C031C6TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "perifericos.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0plus -T"C:\Users\muril\git\FIRMWARE_MI\perifericos\STM32C031C6TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="perifericos.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
