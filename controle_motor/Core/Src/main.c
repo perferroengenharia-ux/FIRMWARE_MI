@@ -75,7 +75,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-  motor_set();
+
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -90,19 +90,21 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  motor_set(); // Configura as variáveis iniciais
+  motor_init(); // Configura as variáveis iniciais
 
   // Inicia os PWMs do Motor
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
 
-    // Inicia o Timer de Amostragem (Base de tempo) com Interrupção
-    HAL_TIM_Base_Start_IT(&htim3);
-
-    // Para teste rápido: Ligar motor após 1 segundo
-    HAL_Delay(1000);
-    motor_desligado = true;
+    // <--- INDISPENSÁVEL: Ligar Interrupção do TIM3
+      if (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK)
+      {
+          Error_Handler();
+      }
 
   /* USER CODE END 2 */
 
