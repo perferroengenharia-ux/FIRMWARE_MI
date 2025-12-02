@@ -4,28 +4,24 @@
 #include "main.h"
 #include "stdbool.h"
 
-// --- CONTROLO (Live Watch) ---
+// --- COMANDOS (Inputs) ---
 extern volatile bool cmd_ligar_motor;
 extern volatile float cmd_frequencia_alvo;
 
-// --- LEITURA ---
+// --- MONITORAMENTO (Outputs) ---
 extern volatile float f_atual;
 extern volatile uint8_t P01;
+extern volatile uint32_t debug_isr_cnt; // Contador de interrupções
 
 // --- PARÂMETROS ---
-extern volatile uint32_t P10;
-extern volatile uint32_t P11;
-extern volatile uint8_t P20;
-extern volatile uint8_t P21;
-extern volatile uint8_t P42;
-
-// --- DEBUG ---
-extern volatile uint32_t debug_isr_cnt;
-extern volatile uint32_t debug_task_cnt;
-extern volatile uint32_t debug_isr_time; // Para medir carga da CPU (opcional)
+extern volatile uint32_t P10; // Tempo Aceleração (s)
+extern volatile uint32_t P11; // Tempo Desaceleração (s)
+extern volatile uint8_t  P20; // Freq Min
+extern volatile uint8_t  P21; // Freq Max
+extern volatile uint8_t  P42; // Freq Amostragem (x100)
 
 void motor_init(void);
-void motor_task(void);
-void spwm(void);
+void motor_task(void); // Agora serve apenas para pré-cálculos leves
+void spwm(void);       // Roda toda a mágica
 
 #endif /* CONTROLE_MOTOR_H_ */
