@@ -101,12 +101,6 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
 
-    // <--- INDISPENSÁVEL: Ligar Interrupção do TIM3
-      if (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK)
-      {
-          Error_Handler();
-      }
-
   /* USER CODE END 2 */
 
   /* Infinite loop */

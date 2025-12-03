@@ -43,7 +43,8 @@ void motor_init(void) {
     if (P21 == 0) P21 = 60;
 
     // Inicializa variáveis para evitar NaN ou Infinito
-    f_atual = (float)P20;
+
+    f_atual = 5.0f;
     cmd_frequencia_alvo = 0.0f;
 
     // Força uma primeira execução da lógica de parâmetros
@@ -108,7 +109,7 @@ void motor_task(void) {
     //ramp_inc_up   = delta / (t_acc * fs);
     //ramp_inc_down = delta / (t_dec * fs);
 
-    float delta = cmd_frequencia_alvo / 3.6f;
+    float delta = cmd_frequencia_alvo - f_atual; // 3.6f;
 
     // Garante que o alvo respeite os limites de frequência P20 e P21
     // (Apenas para o cálculo do delta máximo, o controle fino é feito no spwm)
@@ -121,8 +122,32 @@ void motor_task(void) {
     if (t_dec < 0.1f) t_dec = 0.1f;
 
     // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
-    ramp_inc_up   = delta / (t_acc * 1000.0f);
-    ramp_inc_down = delta / (t_dec * 1000.0f);
+    ramp_inc_up   = delta / (t_acc * freq_ISR);
+    ramp_inc_down = delta / (t_dec * freq_ISR);
+
+    // Controle da ativação da ISR do TIM3
+    if (cmd_ligar_motor) {
+        // Liga interrupção se estiver desligada
+        if ((TIM3->DIER & TIM_DIER_UIE) == 0) {
+            __HAL_TIM_SET_COUNTER(&htim3, 0);
+            HAL_TIM_Base_Start_IT(&htim3);
+        }
+    }
+    else {
+        // Só desliga quando a frequência já chegou a zero
+        if (f_atual <= 0.1f) {
+            HAL_TIM_Base_Stop_IT(&htim3);
+
+            // Zera PWM imediatamente por segurança
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+
+            // Garante que ângulos parem
+            theta_u = theta_v = theta_w = 0.0f;
+        }
+    }
+
 }
 
 // ============================================================================
