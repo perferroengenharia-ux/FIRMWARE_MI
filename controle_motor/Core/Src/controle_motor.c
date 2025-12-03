@@ -8,10 +8,10 @@
 
 // Inputs
 volatile uint8_t  P01 = 0;
-volatile uint32_t P10 = 5;
+volatile uint32_t P10 = 15;
 volatile uint32_t P11 = 5;
 volatile uint8_t  P20 = 5;
-volatile uint8_t  P21 = 60;
+volatile uint8_t  P21 = 90;
 volatile uint8_t  P42 = 100; // 10kHz (Cuidado no C031, ideal é 50/5kHz)
 
 volatile bool  cmd_ligar_motor = false;
@@ -70,7 +70,7 @@ void motor_task(void) {
     // Step = 60 / (5 * 5000) = 0.0024 Hz/int
     //float f_max = (float)P21;
 
-    float delta = cmd_frequencia_alvo - f_atual;
+    float delta = cmd_frequencia_alvo / 3.6f;
 
     float t_acc = (float)P10;
     if (t_acc < 0.1f) t_acc = 0.1f;
@@ -79,8 +79,8 @@ void motor_task(void) {
     if (t_dec < 0.1f) t_dec = 0.1f;
 
     // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
-    ramp_inc_up   = delta / (t_acc * fs);
-    ramp_inc_down = delta / (t_dec * fs);
+    ramp_inc_up   = delta / (t_acc * 1000.0f);
+    ramp_inc_down = delta / (t_dec * 1000.0f);
 }
 
 // ============================================================================
