@@ -141,7 +141,7 @@ void spwm(void) {
 
     if (cmd_ligar_motor) {
         // Modo Aceleração / Operação
-        alvo = cmd_frequencia_alvo * 3.6f;
+        alvo = cmd_frequencia_alvo;
         // Clamp do alvo
         if (alvo > (float)P21) alvo = (float)P21;
         if (alvo < (float)P20) alvo = (float)P20;
@@ -168,7 +168,7 @@ void spwm(void) {
     }
 
     // Atualiza visualização
-    P01 = (uint8_t)f_atual / 3.6f;
+    P01 = (uint8_t)f_atual;
 
     // --- B. Verificação de Parada Total ---
     if (!cmd_ligar_motor && f_atual <= 0.1f) {
@@ -181,7 +181,7 @@ void spwm(void) {
 
     // --- C. Cálculo de Ângulo (Otimizado) ---
     // inc = 2PI * f / fs. Usamos a multiplicação pré-calculada.
-    float inc = f_atual * inv_fs_2pi;
+    float inc = f_atual * inv_fs_2pi * 3.6f;
 
     theta_u += inc;
     theta_v += inc;
