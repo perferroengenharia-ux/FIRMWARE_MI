@@ -12,7 +12,7 @@ volatile uint32_t P10 = 15;
 volatile uint32_t P11 = 5;
 volatile uint8_t  P20 = 5;
 volatile uint8_t  P21 = 90;
-volatile uint8_t  P42 = 100; // 10kHz (Cuidado no C031, ideal é 50/5kHz)
+volatile uint8_t  P42 = 10; // 10kHz
 
 volatile bool  cmd_ligar_motor = false;
 volatile float cmd_frequencia_alvo = 0.0f;
@@ -57,20 +57,61 @@ void motor_init(void) {
  * Ela NÃO executa a rampa, apenas calcula as taxas de aceleração
  * baseadas em P10/P11 para o ISR usar. Isso é muito leve. */
 void motor_task(void) {
-    // 1. Calcula Frequência de Amostragem Real
-    float fs = (float)P42 * 100.0f;
-    if (fs < 1000.0f) fs = 1000.0f;
 
-    // 2. Prepara constante para cálculo de angulo (evita divisão no ISR)
-    // No ISR faremos: angulo += f_atual * inv_fs_2pi
-    inv_fs_2pi = TWO_PI / fs;
+	// --- 1. APLICAÇÃO DOS LIMITES (PROTEÇÃO) ---
 
-    // 3. Calcula incremento da Rampa (Hertz por Interrupção)
-    // Se P10 = 5s, fs = 5000Hz. Fmax = 60Hz.
-    // Step = 60 / (5 * 5000) = 0.0024 Hz/int
-    //float f_max = (float)P21;
+	    // P10: Tempo de Aceleração (5 a 60s)
+	    if (P10 < 5)  P10 = 5;
+	    if (P10 > 60) P10 = 60;
+
+	    // P11: Tempo de Desaceleração (5 a 60s)
+	    if (P11 < 5)  P11 = 5;
+	    if (P11 > 60) P11 = 60;
+
+	    // P20: Frequência Mínima (1 a 24Hz)
+	    if (P20 < 1)  P20 = 1;
+	    if (P20 > 24) P20 = 24;
+
+	    // P21: Frequência Máxima (23 a 90Hz)
+	    if (P21 < 23) P21 = 23;
+	    if (P21 > 90) P21 = 90;
+
+	    // P42: Frequência de Chaveamento (Apenas 5, 10 ou 15 kHz)
+	    // Lógica de "snap": força o valor mais próximo ou padrão seguro
+	    if (P42 <= 7) {
+	        P42 = 5;
+	    } else if (P42 <= 12) {
+	        P42 = 10;
+	    } else {
+	        P42 = 15;
+	    }
+
+	    // --- 2. CÁLCULOS DO SISTEMA ---
+
+	    // Calcula FS baseado em kHz (x1000)
+	    // Se P42 = 10, fs = 10000 Hz.
+	    float fs = (float)P42 * 1000.0f;
+
+	    // Otimização para o ISR (2PI / fs)
+	    inv_fs_2pi = TWO_PI / fs;
+
+    // float delta = cmd_frequencia_alvo - f_atual;
+
+    //float t_acc = (float)P10;
+    //if (t_acc < 0.1f) t_acc = 0.1f;
+
+    //float t_dec = (float)P11;
+    //if (t_dec < 0.1f) t_dec = 0.1f;
+
+    // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
+    //ramp_inc_up   = delta / (t_acc * fs);
+    //ramp_inc_down = delta / (t_dec * fs);
 
     float delta = cmd_frequencia_alvo / 3.6f;
+
+    // Garante que o alvo respeite os limites de frequência P20 e P21
+    // (Apenas para o cálculo do delta máximo, o controle fino é feito no spwm)
+    if (delta > (float)P21) delta = (float)P21;
 
     float t_acc = (float)P10;
     if (t_acc < 0.1f) t_acc = 0.1f;
