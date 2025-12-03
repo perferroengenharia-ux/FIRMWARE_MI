@@ -74,7 +74,7 @@ void motor_task(void) {
 
 	    // P21: Frequência Máxima (23 a 90Hz)
 	    if (P21 < 23) P21 = 23;
-	    if (P21 > 90) P21 = 90;
+	    //if (P21 > 90) P21 = 90;
 
 	    // P42: Frequência de Chaveamento (Apenas 5, 10 ou 15 kHz)
 	    // Lógica de "snap": força o valor mais próximo ou padrão seguro
@@ -88,12 +88,13 @@ void motor_task(void) {
 
 	    // --- 2. CÁLCULOS DO SISTEMA ---
 
-	    // Calcula FS baseado em kHz (x1000)
-	    // Se P42 = 10, fs = 10000 Hz.
-	    float fs = (float)P42 * 1000.0f;
+	    uint32_t psc = TIM3->PSC;
+	    uint32_t arr = TIM3->ARR;
+	    float tim_clk = 48000000.0f;
 
-	    // Otimização para o ISR (2PI / fs)
-	    inv_fs_2pi = TWO_PI / fs;
+	    float freq_ISR = tim_clk / ((psc + 1) * (arr + 1));
+
+	    inv_fs_2pi = TWO_PI / freq_ISR;
 
     // float delta = cmd_frequencia_alvo - f_atual;
 
@@ -140,7 +141,7 @@ void spwm(void) {
 
     if (cmd_ligar_motor) {
         // Modo Aceleração / Operação
-        alvo = cmd_frequencia_alvo;
+        alvo = cmd_frequencia_alvo * 3.6f;
         // Clamp do alvo
         if (alvo > (float)P21) alvo = (float)P21;
         if (alvo < (float)P20) alvo = (float)P20;
@@ -167,7 +168,7 @@ void spwm(void) {
     }
 
     // Atualiza visualização
-    P01 = (uint8_t)f_atual;
+    P01 = (uint8_t)f_atual / 3.6f;
 
     // --- B. Verificação de Parada Total ---
     if (!cmd_ligar_motor && f_atual <= 0.1f) {
