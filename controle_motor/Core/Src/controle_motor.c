@@ -43,7 +43,7 @@ void motor_init(void) {
     if (P21 == 0) P21 = 60;
 
     // Inicializa variáveis para evitar NaN ou Infinito
-    f_atual = 0.0f;
+    f_atual = (float)P20;
     cmd_frequencia_alvo = 0.0f;
 
     // Força uma primeira execução da lógica de parâmetros
@@ -74,7 +74,7 @@ void motor_task(void) {
 
 	    // P21: Frequência Máxima (23 a 90Hz)
 	    if (P21 < 23) P21 = 23;
-	    //if (P21 > 90) P21 = 90;
+	    if (P21 > 90) P21 = 90;
 
 	    // P42: Frequência de Chaveamento (Apenas 5, 10 ou 15 kHz)
 	    // Lógica de "snap": força o valor mais próximo ou padrão seguro
