@@ -23,5 +23,6 @@ extern volatile uint8_t  P42; // Freq Amostragem (x100)
 void motor_init(void);
 void motor_task(void); // Agora serve apenas para pré-cálculos leves
 void spwm(void);       // Roda toda a mágica
+void calcula_rampa(void);
 
 #endif /* CONTROLE_MOTOR_H_ */

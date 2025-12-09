@@ -159,6 +159,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM3)
   {
     spwm();
+    calcula_rampa();
   }
 }
 /* USER CODE END 4 */

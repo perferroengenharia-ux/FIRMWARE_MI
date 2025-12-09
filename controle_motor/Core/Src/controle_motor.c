@@ -10,7 +10,7 @@
 volatile uint8_t  P01 = 0;
 volatile uint32_t P10 = 15;
 volatile uint32_t P11 = 5;
-volatile uint8_t  P20 = 5;
+volatile uint8_t  P20 = 1;
 volatile uint8_t  P21 = 90;
 volatile uint8_t  P42 = 10; // 10kHz
 
@@ -22,7 +22,7 @@ volatile float f_atual = 0.0f;
 volatile uint32_t debug_isr_cnt = 0;
 
 // Variáveis de Memória
-static uint8_t P20_run = 5;
+static uint8_t P20_run = 1;
 static uint8_t P21_run = 90;
 static bool last_motor_state = false;
 
@@ -113,28 +113,24 @@ void motor_task(void) {
         if (cmd_frequencia_alvo > P21) cmd_frequencia_alvo = P21;
 	}
 
-	    // --- 2. CÁLCULOS DO SISTEMA ---
-	    uint32_t psc = TIM3->PSC;
-	    uint32_t arr = TIM3->ARR;
-	    float tim_clk = 48000000.0f;
+	// --- 2. CÁLCULOS DO SISTEMA ---
+	uint32_t psc = TIM3->PSC;
+	uint32_t arr = TIM3->ARR;
+	float tim_clk = 48000000.0f;
+	float freq_ISR = tim_clk / ((psc + 1) * (arr + 1));
+	inv_fs_2pi = TWO_PI / freq_ISR;
 
-	    float freq_ISR = tim_clk / ((psc + 1) * (arr + 1));
+	float delta = 0.0f;
 
-	    inv_fs_2pi = TWO_PI / freq_ISR;
-
-    // float delta = cmd_frequencia_alvo - f_atual;
-
-    //float t_acc = (float)P10;
-    //if (t_acc < 0.1f) t_acc = 0.1f;
-
-    //float t_dec = (float)P11;
-    //if (t_dec < 0.1f) t_dec = 0.1f;
-
-    // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
-    //ramp_inc_up   = delta / (t_acc * fs);
-    //ramp_inc_down = delta / (t_dec * fs);
-
-    float delta = cmd_frequencia_alvo / 3.6f;
+	if (!last_motor_state){
+		delta  = cmd_frequencia_alvo;
+	}
+	else {
+		calcula_rampa();
+		//delta = cmd_frequencia_alvo - (f_atual - 0.01f);
+		//if(delta <= 0){
+			//delta = delta * -1;
+		}
 
     // Garante que o alvo respeite os limites de frequência P20 e P21
     // (Apenas para o cálculo do delta máximo, o controle fino é feito no spwm)
@@ -147,8 +143,8 @@ void motor_task(void) {
     if (t_dec < 0.1f) t_dec = 0.1f;
 
     // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
-    ramp_inc_up   = delta / (t_acc * 1000.0f);
-    ramp_inc_down = delta / (t_dec * 1000.0f);
+    ramp_inc_up   = delta / (t_acc * arr * 24.0f);
+    ramp_inc_down = delta / (t_dec * arr * 24.0f);
 
     // Controle da ativação da ISR do TIM3
     if (cmd_ligar_motor) {
@@ -175,6 +171,26 @@ void motor_task(void) {
         }
     }
 
+}
+
+void calcula_rampa(){
+
+	uint32_t arr = TIM3->ARR;
+	float delta = 0.0f;
+    if (delta > (float)P21) delta = (float)P21;
+
+    float t_acc = (float)P10;
+    if (t_acc < 0.1f) t_acc = 0.1f;
+
+    float t_dec = (float)P11;
+    if (t_dec < 0.1f) t_dec = 0.1f;
+
+    delta = cmd_frequencia_alvo - (f_atual + 0.01f);
+    	if(delta <= 0) delta = delta * -1;
+
+    // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
+    ramp_inc_up   = delta / (t_acc * arr * 5.0f);
+    ramp_inc_down = delta / (t_dec * arr * 5.0f);
 }
 
 // ============================================================================
