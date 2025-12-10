@@ -127,10 +127,7 @@ void motor_task(void) {
 	}
 	else {
 		calcula_rampa();
-		//delta = cmd_frequencia_alvo - (f_atual - 0.01f);
-		//if(delta <= 0){
-			//delta = delta * -1;
-		}
+	}
 
     // Garante que o alvo respeite os limites de frequência P20 e P21
     // (Apenas para o cálculo do delta máximo, o controle fino é feito no spwm)
@@ -143,8 +140,8 @@ void motor_task(void) {
     if (t_dec < 0.1f) t_dec = 0.1f;
 
     // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
-    ramp_inc_up   = delta / (t_acc * arr * 24.0f);
-    ramp_inc_down = delta / (t_dec * arr * 24.0f);
+    ramp_inc_up   = delta / t_acc; //* arr * 24.0f);
+    ramp_inc_down = delta / t_dec; //* arr * 24.0f);
 
     // Controle da ativação da ISR do TIM3
     if (cmd_ligar_motor) {
@@ -191,6 +188,14 @@ void calcula_rampa(){
     // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
     ramp_inc_up   = delta / (t_acc * arr * 5.0f);
     ramp_inc_down = delta / (t_dec * arr * 5.0f);
+
+    if (f_atual > (cmd_frequencia_alvo - 0.1f) && cmd_ligar_motor == true){
+    	f_atual = cmd_frequencia_alvo;
+    }
+
+    if (f_atual > (cmd_frequencia_alvo - 0.1f) && cmd_ligar_motor == false){
+        	f_atual = cmd_frequencia_alvo - 0.15f;
+    }
 }
 
 // ============================================================================
