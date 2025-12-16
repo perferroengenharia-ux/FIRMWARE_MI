@@ -260,7 +260,15 @@ void spwm(void) {
     }
 
     // --- C. Ângulos ---
-    float inc = f_atual * inv_fs_2pi * 3.6f;
+    float inc = 0.0f;
+
+    if (last_P42 == 15){
+    	inc = f_atual * inv_fs_2pi * 6.45f;
+    } else if (last_P42 == 10){
+    	inc = f_atual * inv_fs_2pi * 4.31f;
+    } else {
+    	inc = f_atual * inv_fs_2pi * 2.16f;
+    }
 
     theta_u += inc;
     if (theta_u >= TWO_PI) theta_u -= TWO_PI;
