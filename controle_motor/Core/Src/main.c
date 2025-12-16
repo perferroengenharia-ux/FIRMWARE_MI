@@ -108,8 +108,9 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-	  motor_task();
+
     /* USER CODE BEGIN 3 */
+	  motor_task();
   }
   /* USER CODE END 3 */
 }

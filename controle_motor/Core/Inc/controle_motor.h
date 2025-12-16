@@ -24,5 +24,6 @@ void motor_init(void);
 void motor_task(void); // Agora serve apenas para pré-cálculos leves
 void spwm(void);       // Roda toda a mágica
 void calcula_rampa(void);
+void atualiza_P42(void);
 
 #endif /* CONTROLE_MOTOR_H_ */

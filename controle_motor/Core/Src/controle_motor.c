@@ -7,39 +7,46 @@
 // ============================================================================
 
 // Inputs
-volatile uint8_t  P01 = 0;
+volatile uint8_t P01 = 0;
 volatile uint32_t P10 = 15;
 volatile uint32_t P11 = 5;
-volatile uint8_t  P20 = 1;
-volatile uint8_t  P21 = 90;
-volatile uint8_t  P42 = 10; // 10kHz
+volatile uint8_t P20 = 1;
+volatile uint8_t P21 = 90;
+volatile uint8_t P42 = 10;
 
-volatile bool  cmd_ligar_motor = false;
+volatile bool cmd_ligar_motor = false;
 volatile float cmd_frequencia_alvo = 0.0f;
 
 // Outputs
 volatile float f_atual = 0.0f;
 volatile uint32_t debug_isr_cnt = 0;
 
-// Variáveis de Memória
+// Variáveis de Memória (Shadow Registers)
 static uint8_t P20_run = 1;
 static uint8_t P21_run = 90;
-static bool last_motor_state = false;
+static uint32_t P10_run = 15;
+static uint32_t P11_run = 5;
 
-// Variáveis de Controle da Rampa (Calculadas no motor_task, usadas no ISR)
-volatile float ramp_inc_up = 0.0f;   // Quanto somar para acelerar
-volatile float ramp_inc_down = 0.0f; // Quanto subtrair para desacelerar
-volatile float inv_fs_2pi = 0.0f;    // Otimização: (2*PI)/fs
+// Controle de Estado
+static bool last_motor_state = false;
+static uint8_t last_P42 = 0;
+
+// Variáveis de Controle da Rampa
+volatile float ramp_inc_up = 0.0f;
+volatile float ramp_inc_down = 0.0f;
+volatile float inv_fs_2pi = 0.0f;
+
+// Variáveis Dinâmicas de Hardware
+volatile uint32_t current_arr = 99;
+volatile float amp_max_atual = 50.0f;
+volatile float freq_ISR = 10000.0f;
 
 // Ângulos
 static float theta_u = 0.0f;
-static float theta_v = 2.094395f; // 2PI/3
-static float theta_w = 4.188790f; // 4PI/3
+static float theta_v = 2.094395f;
+static float theta_w = 4.188790f;
 
-// Constantes
 static const float TWO_PI = 6.283185307f;
-#define AMP_MAX 50.0f // Seu ARR do Timer (ajuste se necessário)
-static const float FATOR_VF = 0.83f; // V/F
 
 // ============================================================================
 // 2. INICIALIZAÇÃO
@@ -47,192 +54,193 @@ static const float FATOR_VF = 0.83f; // V/F
 void motor_init(void) {
     if (P21 == 0) P21 = 60;
 
-    // Inicializa variáveis para evitar NaN ou Infinito
-
-    f_atual = 5.0f;
+    f_atual = (float) P20;
     cmd_frequencia_alvo = 5.0f;
+    last_P42 = 0;
 
-    // Força uma primeira execução da lógica de parâmetros
+    P10_run = P10;
+    P11_run = P11;
+    P20_run = P20;
+    P21_run = P21;
+
     motor_task();
 }
 
 // ============================================================================
-// 3. MOTOR TASK (Loop Lento - Apenas Parametrização)
+// 3. MOTOR TASK (Loop Lento)
 // ============================================================================
-/* Esta função deve ficar no while(1).
- * Ela NÃO executa a rampa, apenas calcula as taxas de aceleração
- * baseadas em P10/P11 para o ISR usar. Isso é muito leve. */
-
 void motor_task(void) {
-	// Detecta transição: motor desligado -> motor ligado
-	if (!last_motor_state && cmd_ligar_motor) {
-	    // Congela limites
-	    P20_run = P20;
-	    P21_run = P21;
+    // --- LÓGICA DO P42 ---
+    if (P42 != last_P42) {
+        if (P42 <= 7) P42 = 5;
+        else if (P42 <= 12) P42 = 10;
+        else P42 = 15;
 
-	    // Garante clamps no snapshot
-	    if (P20_run < 1)  P20_run = 1;
-	    if (P20_run > 24) P20_run = 24;
+        atualiza_P42();
+        last_P42 = P42;
+    }
 
-	    if (P21_run < 23) P21_run = 23;
-	    if (P21_run > 90) P21_run = 90;
-	}
+    // --- LÓGICA DE ESTADO DO MOTOR ---
+    if (!last_motor_state && cmd_ligar_motor) {
+        // Travamento dos parâmetros na partida
+        P20_run = P20;
+        P21_run = P21;
+        P10_run = P10;
+        P11_run = P11;
 
-	// Atualiza estado anterior
-	last_motor_state = cmd_ligar_motor;
+        if (P20_run < 1)  P20_run = 1;
+        if (P20_run > 24) P20_run = 24;
 
-	if (!cmd_ligar_motor) {
-	// --- 1. APLICAÇÃO DOS LIMITES (PROTEÇÃO) ---
-	    // P10: Tempo de Aceleração (5 a 60s)
-	    if (P10 < 5)  P10 = 5;
-	    if (P10 > 60) P10 = 60;
+        if (P21_run < 23) P21_run = 23;
+        if (P21_run > 90) P21_run = 90;
 
-	    // P11: Tempo de Desaceleração (5 a 60s)
-	    if (P11 < 5)  P11 = 5;
-	    if (P11 > 60) P11 = 60;
+        if (P10_run < 5)  P10_run = 5;
+        if (P10_run > 60) P10_run = 60;
 
-	    // P20: Frequência Mínima (1 a 24Hz)
-	    if (P20 < 1)  P20 = 1;
-	    if (P20 > 24) P20 = 24;
+        if (P11_run < 5)  P11_run = 5;
+        if (P11_run > 60) P11_run = 60;
+    }
+    last_motor_state = cmd_ligar_motor;
 
-	    // P21: Frequência Máxima (23 a 90Hz)
-	    if (P21 < 23) P21 = 23;
-	    if (P21 > 90) P21 = 90;
+    if (!cmd_ligar_motor) {
+        if (P10 < 5) P10 = 5;
+        if (P10 > 60) P10 = 60;
 
-	    // P42: Frequência de Chaveamento (Apenas 5, 10 ou 15 kHz)
-	    // Lógica de "snap": força o valor mais próximo ou padrão seguro
-	    if (P42 <= 7) {
-	        P42 = 5;
-	    } else if (P42 <= 12) {
-	        P42 = 10;
-	    } else {
-	        P42 = 15;
-	    }
+        if (P11 < 5) P11 = 5;
+        if (P11 > 60) P11 = 60;
+
+        if (P20 < 1) P20 = 1;
+        if (P20 > 24) P20 = 24;
+
+        if (P21 < 23) P21 = 23;
+        if (P21 > 90) P21 = 90;
 
         if (cmd_frequencia_alvo < P20) cmd_frequencia_alvo = P20;
         if (cmd_frequencia_alvo > P21) cmd_frequencia_alvo = P21;
-	}
+    }
 
-	// --- 2. CÁLCULOS DO SISTEMA ---
-	uint32_t psc = TIM3->PSC;
-	uint32_t arr = TIM3->ARR;
-	float tim_clk = 48000000.0f;
-	float freq_ISR = tim_clk / ((psc + 1) * (arr + 1));
-	inv_fs_2pi = TWO_PI / freq_ISR;
+    // --- CÁLCULOS ---
+    inv_fs_2pi = TWO_PI / freq_ISR;
 
-	float delta = 0.0f;
+    // Atualiza steps da rampa
+    calcula_rampa();
 
-	if (!last_motor_state){
-		delta  = cmd_frequencia_alvo;
-	}
-	else {
-		calcula_rampa();
-	}
-
-    // Garante que o alvo respeite os limites de frequência P20 e P21
-    // (Apenas para o cálculo do delta máximo, o controle fino é feito no spwm)
-    if (delta > (float)P21) delta = (float)P21;
-
-    float t_acc = (float)P10;
-    if (t_acc < 0.1f) t_acc = 0.1f;
-
-    float t_dec = (float)P11;
-    if (t_dec < 0.1f) t_dec = 0.1f;
-
-    // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
-    ramp_inc_up   = delta / t_acc; //* arr * 24.0f);
-    ramp_inc_down = delta / t_dec; //* arr * 24.0f);
-
-    // Controle da ativação da ISR do TIM3
+    // Controle Timer
     if (cmd_ligar_motor) {
-
         if (cmd_frequencia_alvo < P20) cmd_frequencia_alvo = P20;
         if (cmd_frequencia_alvo > P21) cmd_frequencia_alvo = P21;
 
-        // Liga interrupção se estiver desligada
         if ((TIM3->DIER & TIM_DIER_UIE) == 0) {
             __HAL_TIM_SET_COUNTER(&htim3, 0);
             HAL_TIM_Base_Start_IT(&htim3);
         }
     }
     else {
-        // Só desliga quando a frequência já chegou a zero
         if (f_atual <= 0.1f) {
             HAL_TIM_Base_Stop_IT(&htim3);
-
-            // Zera PWM imediatamente por segurança
             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+        }
+    }
+}
 
+// ============================================================================
+// FUNÇÃO AUXILIAR: ATUALIZA HARDWARE
+// ============================================================================
+void atualiza_P42(void) {
+    if (P42 == 5) {
+        current_arr = 199;
+    } else if (P42 == 15) {
+        current_arr = 66;
+    } else {
+        P42 = 10;
+        current_arr = 99;
+    }
+    amp_max_atual = (float)(current_arr + 1) / 2.0f;
+    freq_ISR = 1000000.0f / (float)(current_arr + 1);
+
+    __HAL_TIM_SET_AUTORELOAD(&htim1, current_arr);
+    __HAL_TIM_SET_AUTORELOAD(&htim3, current_arr);
+}
+
+// ============================================================================
+// CÁLCULO DA RAMPA (CORRIGIDO)
+// ============================================================================
+void calcula_rampa(){
+    float t_acc = (float)P10_run; if (t_acc < 0.1f) t_acc = 0.1f;
+    float t_dec = (float)P11_run; if (t_dec < 0.1f) t_dec = 0.1f;
+    float f_max_ref = (float)cmd_frequencia_alvo; // Baseado no alvo atual
+
+    // Multiplicadores
+    if (last_P42 == 15){
+        ramp_inc_up   = f_max_ref / ((t_acc * freq_ISR) / 6.7f);
+        ramp_inc_down = f_max_ref / ((t_dec * freq_ISR) / 6.7f);
+    } else if (last_P42 == 10){
+        ramp_inc_up   = f_max_ref / ((t_acc * freq_ISR) / 3.9f);
+        ramp_inc_down = f_max_ref / ((t_dec * freq_ISR) / 3.9f);
+    } else { // P42 == 5
+        ramp_inc_up   = f_max_ref / ((t_acc * freq_ISR) / 2.2f);
+        ramp_inc_down = f_max_ref / ((t_dec * freq_ISR) / 2.2f);
+    }
+
+    // --- CORREÇÃO DO TRUNCAMENTO ---
+    // Removemos o "if" que forçava f_atual = cmd se f_atual > cmd.
+    // Substituímos por uma lógica de histerese para evitar oscilação no estado estacionário.
+
+    if (cmd_ligar_motor) {
+        float diferenca = f_atual - cmd_frequencia_alvo;
+        // Pega valor absoluto da diferença
+        if (diferenca < 0.0f) diferenca = -diferenca;
+
+        // Só força o valor se estiver MUITO PERTO (menos de 0.1Hz de erro)
+        if (diferenca < 0.1f) {
+            f_atual = cmd_frequencia_alvo;
         }
     }
 
-}
-
-void calcula_rampa(){
-
-	uint32_t arr = TIM3->ARR;
-	float delta = 0.0f;
-    if (delta > (float)P21) delta = (float)P21;
-
-    float t_acc = (float)P10;
-    if (t_acc < 0.1f) t_acc = 0.1f;
-
-    float t_dec = (float)P11;
-    if (t_dec < 0.1f) t_dec = 0.1f;
-
-    delta = cmd_frequencia_alvo - (f_atual + 0.01f);
-    	if(delta <= 0) delta = delta * -1;
-
-    // Atualiza variáveis globais atômicas (float é atômico em 32-bit geralmente)
-    ramp_inc_up   = delta / (t_acc * arr * 5.0f);
-    ramp_inc_down = delta / (t_dec * arr * 5.0f);
-
-    if (f_atual > (cmd_frequencia_alvo - 0.1f) && cmd_ligar_motor == true){
-    	f_atual = cmd_frequencia_alvo;
-    }
-
+    // Mantemos a histerese de desligamento
     if (f_atual > (cmd_frequencia_alvo - 0.1f) && cmd_ligar_motor == false){
-        	f_atual = cmd_frequencia_alvo - 0.15f;
+        f_atual = cmd_frequencia_alvo - 0.15f;
     }
 }
 
 // ============================================================================
-// 4. SPWM (Interrupção - Lógica Completa)
+// 4. SPWM (Interrupção) - (CORRIGIDO PARA SUAVIZAÇÃO)
 // ============================================================================
-/* Esta função deve ser chamada no Callback do TIM3.
- * Ela contém a Lógica da Rampa + Lógica do Seno (Fusion do código validado) */
 void spwm(void) {
     debug_isr_cnt++;
 
-    //motor_task();
-
-    // --- A. Lógica da Rampa (Inspirado no código validado) ---
+    // --- A. Lógica da Rampa ---
     float alvo = 0.0f;
     float step = 0.0f;
 
     if (cmd_ligar_motor) {
-        // Modo Aceleração / Operação
         alvo = cmd_frequencia_alvo;
-        // Clamp do alvo
+
+        // Clamp dinâmico
         if (alvo > (float)P21_run) alvo = (float)P21_run;
         if (alvo < (float)P20_run) alvo = (float)P20_run;
 
-        step = ramp_inc_up; // Usa taxa de subida
-
+        // Decide se acelera ou desacelera para chegar no alvo
         if (f_atual < alvo) {
+            // ACELERANDO (Subindo para o alvo) -> Usa P10 (ramp_inc_up)
+            step = ramp_inc_up;
             f_atual += step;
             if (f_atual > alvo) f_atual = alvo;
-        } else if (f_atual > alvo) {
-            f_atual -= step; // Se mudou setpoint pra baixo, desacelera suave
+        }
+        else if (f_atual > alvo) {
+            // DESACELERANDO (Descendo para o novo alvo) -> Agora usa P11 (ramp_inc_down)
+            // Isso garante a suavização igual ao desligamento
+            step = ramp_inc_down;
+            f_atual -= step;
             if (f_atual < alvo) f_atual = alvo;
         }
     }
     else {
-        // Modo Parada
+        // Desligando -> Usa P11 (ramp_inc_down)
         alvo = 0.0f;
-        step = ramp_inc_down; // Usa taxa de descida
+        step = ramp_inc_down;
 
         if (f_atual > 0.0f) {
             f_atual -= step;
@@ -240,44 +248,40 @@ void spwm(void) {
         }
     }
 
-    // Atualiza visualização
     P01 = (uint8_t)f_atual;
 
-    // --- B. Verificação de Parada Total ---
+    // --- B. Verificação de Parada ---
     if (!cmd_ligar_motor && f_atual <= 0.1f) {
-        // Desliga PWM e sai para economizar CPU
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+        HAL_TIM_Base_Stop_IT(&htim3);
         return;
     }
 
-    // --- C. Cálculo de Ângulo (Otimizado) ---
-    // inc = 2PI * f / fs. Usamos a multiplicação pré-calculada.
+    // --- C. Ângulos ---
     float inc = f_atual * inv_fs_2pi * 3.6f;
 
     theta_u += inc;
-    theta_v += inc;
-    theta_w += inc;
-
-    // Wrap-around (Substitui fmodf para performance no C031)
     if (theta_u >= TWO_PI) theta_u -= TWO_PI;
+
+    theta_v = theta_u + 2.094395f;
     if (theta_v >= TWO_PI) theta_v -= TWO_PI;
+
+    theta_w = theta_u + 4.188790f;
     if (theta_w >= TWO_PI) theta_w -= TWO_PI;
 
-    // --- D. Cálculo Amplitude e PWM ---
-    // V/F Escalar
-    float amp_atual = f_atual * FATOR_VF;
-    if (amp_atual > AMP_MAX) amp_atual = AMP_MAX;
+    // --- D. Amplitude Dinâmica ---
+    float prop_vf = f_atual * 0.01666f;
+    if (prop_vf > 1.0f) prop_vf = 1.0f;
 
-    float offset = AMP_MAX - amp_atual;
+    float amp_atual = prop_vf * amp_max_atual;
+    float offset = amp_max_atual - amp_atual;
 
-    // Seno
     uint16_t p1 = (uint16_t)((amp_atual * (sinf(theta_u) + 1.0f)) + offset);
     uint16_t p2 = (uint16_t)((amp_atual * (sinf(theta_v) + 1.0f)) + offset);
     uint16_t p3 = (uint16_t)((amp_atual * (sinf(theta_w) + 1.0f)) + offset);
 
-    // Hardware
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, p1);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, p2);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, p3);
