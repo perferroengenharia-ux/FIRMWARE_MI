@@ -1,6 +1,8 @@
 #include "controle_motor.h"
 #include "math.h"
 #include "tim.h"
+#include "main.h"
+#include "stm32c0xx_hal.h"
 
 // ============================================================================
 // 1. VARIÁVEIS GLOBAIS
@@ -10,6 +12,7 @@
 volatile uint8_t P01 = 0;
 volatile uint32_t P10 = 15;
 volatile uint32_t P11 = 5;
+volatile uint8_t P12 = 1;
 volatile uint8_t P20 = 1;
 volatile uint8_t P21 = 90;
 volatile uint8_t P42 = 10;
@@ -58,6 +61,16 @@ void motor_init(void) {
     cmd_frequencia_alvo = 5.0f;
     last_P42 = 0;
 
+    if (P12 == 1) {
+            float saved_freq = read_flash_float();
+
+            // Verifica se o valor lido é válido (não é NaN e está dentro dos limites do motor)
+            // 0xFFFFFFFF (flash apagada) resulta em NaN ou valor muito alto
+            if (!isnan(saved_freq) && saved_freq >= (float)P20 && saved_freq <= (float)P21) {
+                cmd_frequencia_alvo = saved_freq;
+        }
+    }
+
     P10_run = P10;
     P11_run = P11;
     P20_run = P20;
@@ -100,6 +113,21 @@ void motor_task(void) {
         if (P11_run < 5)  P11_run = 5;
         if (P11_run > 60) P11_run = 60;
     }
+
+    if (last_motor_state && !cmd_ligar_motor) {
+        if (P12 == 1) {
+            // Só grava se o valor na Flash for diferente (poupa vida útil da Flash)
+            float saved = read_flash_float();
+            float diff = saved - cmd_frequencia_alvo;
+            if (diff < 0) diff = -diff; // Valor absoluto
+
+            // Grava se a diferença for maior que 0.1Hz ou se a flash estiver vazia (NaN)
+            if (diff > 0.1f || isnan(saved)) {
+                write_flash_float(cmd_frequencia_alvo);
+            }
+        }
+    }
+
     last_motor_state = cmd_ligar_motor;
 
     if (!cmd_ligar_motor) {
@@ -162,6 +190,54 @@ void atualiza_P42(void) {
 
     __HAL_TIM_SET_AUTORELOAD(&htim1, current_arr);
     __HAL_TIM_SET_AUTORELOAD(&htim3, current_arr);
+}
+
+// ============================================================================
+// FUNÇÕES DE FLASH (CORRIGIDAS PARA STM32C0)
+// ============================================================================
+
+float read_flash_float(void) {
+    // Lê 32 bits da memória
+    uint32_t data = *(__IO uint32_t*)FLASH_USER_ADDR;
+    return *(float*)&data;
+}
+
+void write_flash_float(float value) {
+    // 1. Desliga Interrupções para evitar travamento (Crítico)
+    __disable_irq();
+
+    HAL_FLASH_Unlock();
+
+    FLASH_EraseInitTypeDef EraseInitStruct;
+    uint32_t PageError;
+
+    // --- CÁLCULO DA PÁGINA (Diferença do C0 para o F1) ---
+    // A HAL do C0 pede o ÍNDICE da página (0, 1, 2...), não o endereço.
+    // Fórmula: (Endereço_Alvo - Inicio_Flash) / Tamanho_Pagina
+    uint32_t page_number = (FLASH_USER_ADDR - FLASH_BASE) / FLASH_PAGE_SIZE;
+
+    // Configura o Apagamento
+    EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
+    EraseInitStruct.Page      = page_number; // Usa .Page ao invés de .PageAddress
+    EraseInitStruct.NbPages   = 1;
+
+    // Apaga a página
+    if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) == HAL_OK) {
+
+        // --- GRAVAÇÃO (Diferença do C0 para o F1) ---
+        // O C0 grava 64 bits (DoubleWord) por vez.
+        // Convertemos o float (32 bits) para um container de 64 bits.
+
+        uint64_t data_to_write = (uint64_t)(*(uint32_t*)&value);
+
+        // Programação tipo DOUBLEWORD
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, FLASH_USER_ADDR, data_to_write);
+    }
+
+    HAL_FLASH_Lock();
+
+    // 2. Religa Interrupções
+    __enable_irq();
 }
 
 // ============================================================================

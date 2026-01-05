@@ -1,5 +1,6 @@
 #ifndef CONTROLE_MOTOR_H_
 #define CONTROLE_MOTOR_H_
+#define FLASH_USER_ADDR 0x08007800
 
 #include "main.h"
 #include "stdbool.h"
@@ -25,5 +26,7 @@ void motor_task(void); // Agora serve apenas para pré-cálculos leves
 void spwm(void);       // Roda toda a mágica
 void calcula_rampa(void);
 void atualiza_P42(void);
+float read_flash_float(void);
+void write_flash_float(float);
 
 #endif /* CONTROLE_MOTOR_H_ */
