@@ -15,6 +15,7 @@ volatile uint32_t P11 = 5;
 volatile uint8_t P12 = 1;
 volatile uint8_t P20 = 1;
 volatile uint8_t P21 = 90;
+volatile uint8_t P35 = 0;
 volatile uint8_t P42 = 10;
 
 volatile bool cmd_ligar_motor = false;
@@ -290,6 +291,7 @@ void spwm(void) {
     // --- A. Lógica da Rampa ---
     float alvo = 0.0f;
     float step = 0.0f;
+    float amp = 0.0f;
 
     if (cmd_ligar_motor) {
         alvo = cmd_frequencia_alvo;
@@ -359,7 +361,14 @@ void spwm(void) {
     float prop_vf = f_atual * 0.01666f;
     if (prop_vf > 1.0f) prop_vf = 1.0f;
 
-    float amp_atual = prop_vf * amp_max_atual;
+    if (f_atual < 20.0f){
+    	amp = amp_max_atual * (1.0f + (P35/10.0f));
+    }
+    else{
+    	amp = amp_max_atual;
+    }
+
+    float amp_atual = prop_vf * amp;
     float offset = amp_max_atual - amp_atual;
 
     uint16_t p1 = (uint16_t)((amp_atual * (sinf(theta_u) + 1.0f)) + offset);
