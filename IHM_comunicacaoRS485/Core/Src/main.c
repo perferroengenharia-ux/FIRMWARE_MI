@@ -2,25 +2,23 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : STM32 RS485 Slave matching ESP32 Protocol
+  * @brief          : STM32 RS485 Slave (DMA+IDLE double-buffer) matching ESP32 Protocol
   ******************************************************************************
   */
 /* USER CODE END Header */
 
-/* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "rs485_link.h"
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
 
 /* Private typedef -----------------------------------------------------------*/
-// Estrutura do Frame para processamento
 typedef struct {
     uint8_t addr, type, seq, len;
     uint8_t payload[128];
 } frame_t;
 
-// Estados da Máquina de Estados do Parser
 typedef enum {
     PS_WAIT_SOF = 0,
     PS_HDR_ADDR,
@@ -55,17 +53,20 @@ typedef struct {
 #define TYPE_ACK        0x80
 #define TYPE_NACK       0x81
 
-#define RX_DMA_BUF_SZ   256
+#define MAX_PAYLOAD     128
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
 
-// Variáveis de controle de recepção
-uint8_t rx_dma_buf[RX_DMA_BUF_SZ];
-volatile uint16_t rx_dma_len = 0;
-volatile bool rx_dma_ready = false;
+/* ====== Double-buffer RX globals (visíveis no it.c) ====== */
+uint8_t rx_dma_buf[2][RX_DMA_BUF_SZ];
+volatile uint16_t rx_ready_len = 0;
+volatile uint8_t  rx_ready_idx = 0;
+volatile bool     rx_dma_ready = false;
+volatile uint8_t  rx_active_idx = 0;
 
+/* Protocol state */
 static frame_parser_t g_parser;
 static uint8_t g_pwm_duty = 0;
 
@@ -75,9 +76,11 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 
-/* --- Funções de Protocolo (Arquitetura ESP32) --- */
-
-static uint16_t crc16_ibm(const uint8_t *data, uint16_t len) {
+/* =========================
+ *  CRC16 (IBM / Modbus) poly 0xA001
+ * ========================= */
+static uint16_t crc16_ibm(const uint8_t *data, uint16_t len)
+{
     uint16_t crc = 0xFFFF;
     for (uint16_t i = 0; i < len; i++) {
         crc ^= data[i];
@@ -89,19 +92,24 @@ static uint16_t crc16_ibm(const uint8_t *data, uint16_t len) {
     return crc;
 }
 
-static void parser_reset(frame_parser_t *p) {
+static void parser_reset(frame_parser_t *p)
+{
     p->st = PS_WAIT_SOF;
     p->esc_next = false;
+    p->addr = p->type = p->seq = p->len = 0;
     p->pay_i = 0;
+    p->crc_l = p->crc_h = 0;
 }
 
-static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame) {
+static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
+{
     if (byte == SOF) {
         p->st = PS_HDR_ADDR;
         p->esc_next = false;
         p->pay_i = 0;
         return false;
     }
+
     if (p->st == PS_WAIT_SOF) return false;
 
     if (p->esc_next) {
@@ -116,38 +124,64 @@ static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame) {
         case PS_HDR_ADDR: p->addr = byte; p->st = PS_HDR_TYPE; break;
         case PS_HDR_TYPE: p->type = byte; p->st = PS_HDR_SEQ; break;
         case PS_HDR_SEQ:  p->seq  = byte; p->st = PS_HDR_LEN; break;
+
         case PS_HDR_LEN:
             p->len = byte;
-            if (p->len > 128) { parser_reset(p); return false; }
+            if (p->len > MAX_PAYLOAD) { parser_reset(p); return false; }
+            p->pay_i = 0;
             p->st = (p->len == 0) ? PS_CRC_L : PS_PAYLOAD;
             break;
+
         case PS_PAYLOAD:
             p->payload[p->pay_i++] = byte;
             if (p->pay_i >= p->len) p->st = PS_CRC_L;
             break;
+
         case PS_CRC_L: p->crc_l = byte; p->st = PS_CRC_H; break;
-        case PS_CRC_H:
+
+        case PS_CRC_H: {
             p->crc_h = byte;
-            uint8_t tmp[132];
-            tmp[0] = p->addr; tmp[1] = p->type; tmp[2] = p->seq; tmp[3] = p->len;
+
+            uint8_t tmp[4 + MAX_PAYLOAD];
+            tmp[0] = p->addr;
+            tmp[1] = p->type;
+            tmp[2] = p->seq;
+            tmp[3] = p->len;
             if (p->len) memcpy(&tmp[4], p->payload, p->len);
-            uint16_t calc = crc16_ibm(tmp, 4 + p->len);
+
+            uint16_t calc   = crc16_ibm(tmp, (uint16_t)(4 + p->len));
             uint16_t rx_crc = (uint16_t)p->crc_l | ((uint16_t)p->crc_h << 8);
+
             if (calc == rx_crc) {
-                out_frame->addr = p->addr; out_frame->type = p->type;
-                out_frame->seq = p->seq; out_frame->len = p->len;
+                out_frame->addr = p->addr;
+                out_frame->type = p->type;
+                out_frame->seq  = p->seq;
+                out_frame->len  = p->len;
                 if (p->len) memcpy(out_frame->payload, p->payload, p->len);
-                parser_reset(p); return true;
+
+                parser_reset(p);
+                return true;
             }
+
+            parser_reset(p);
+            return false;
+        } break;
+
+        default:
             parser_reset(p);
             break;
-        default: parser_reset(p); break;
     }
+
     return false;
 }
 
-static void rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len) {
-    uint8_t raw[140], esc[280];
+/* Escape + montagem do frame de reply com bounds */
+static void rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len)
+{
+    if (len > MAX_PAYLOAD) len = MAX_PAYLOAD;
+
+    uint8_t raw[1 + 4 + MAX_PAYLOAD + 2];
+    uint8_t esc[1 + 2*(4 + MAX_PAYLOAD + 2)];
     uint16_t r_idx = 0, e_idx = 0;
 
     raw[r_idx++] = SOF;
@@ -155,42 +189,78 @@ static void rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, 
     raw[r_idx++] = type;
     raw[r_idx++] = seq;
     raw[r_idx++] = len;
-    if (len && payload) { memcpy(&raw[r_idx], payload, len); r_idx += len; }
-    uint16_t crc = crc16_ibm(&raw[1], r_idx - 1);
+
+    if (len && payload) {
+        memcpy(&raw[r_idx], payload, len);
+        r_idx += len;
+    }
+
+    uint16_t crc = crc16_ibm(&raw[1], (uint16_t)(r_idx - 1));
     raw[r_idx++] = (uint8_t)(crc & 0xFF);
     raw[r_idx++] = (uint8_t)((crc >> 8) & 0xFF);
 
     esc[e_idx++] = SOF;
+
     for (uint16_t i = 1; i < r_idx; i++) {
+        if (e_idx + 2 >= sizeof(esc)) return; // bounds
         if (raw[i] == SOF || raw[i] == ESC) {
-            esc[e_idx++] = ESC; esc[e_idx++] = raw[i] ^ ESC_XOR;
-        } else esc[e_idx++] = raw[i];
+            esc[e_idx++] = ESC;
+            esc[e_idx++] = (uint8_t)(raw[i] ^ ESC_XOR);
+        } else {
+            esc[e_idx++] = raw[i];
+        }
     }
 
+    // guard time
+    for (volatile int i = 0; i < 12000; i++) { }
+
+    // TX enable
     HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_SET);
-    for(volatile int i=0; i<500; i++);
+    for (volatile int i = 0; i < 500; i++) { }
     HAL_UART_Transmit(&huart1, esc, e_idx, 100);
-    while (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET); // Aguarda fim real do bit
-    for(volatile int i=0; i<1000; i++);
+    while (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET) {}
+    HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
+
+    // RX enable
     HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
 }
 
-void process_frame(const frame_t *fr) {
+static void process_frame(const frame_t *fr)
+{
     if (fr->addr != ADDR_STM32) return;
-    if (fr->type == TYPE_PING) rs485_send_reply(TYPE_ACK, fr->seq, NULL, 0);
-    else if (fr->type == TYPE_SET_PWM && fr->len >= 1) {
-        g_pwm_duty = fr->payload[0];
-        rs485_send_reply(TYPE_ACK, fr->seq, NULL, 0);
-    }
-    else if (fr->type == TYPE_READ_STATUS) {
-        uint8_t status[2] = {1, g_pwm_duty}; // Ex: Estado=1, PWM=duty
-        rs485_send_reply(TYPE_ACK, fr->seq, status, 2);
+
+    switch (fr->type) {
+        case TYPE_PING:
+            rs485_send_reply(TYPE_ACK, fr->seq, NULL, 0);
+            break;
+
+        case TYPE_SET_PWM:
+            if (fr->len >= 1) {
+                g_pwm_duty = fr->payload[0];
+                rs485_send_reply(TYPE_ACK, fr->seq, NULL, 0);
+            } else {
+                uint8_t err = 1;
+                rs485_send_reply(TYPE_NACK, fr->seq, &err, 1);
+            }
+            break;
+
+        case TYPE_READ_STATUS: {
+            uint8_t status[2] = { 1, g_pwm_duty };
+            rs485_send_reply(TYPE_ACK, fr->seq, status, 2);
+        } break;
+
+        default: {
+            uint8_t err = 2;
+            rs485_send_reply(TYPE_NACK, fr->seq, &err, 1);
+        } break;
     }
 }
 
-/* --- Main Logic --- */
-
-int main(void) {
+/* =========================
+ *  Main
+ * ========================= */
+int main(void)
+{
     HAL_Init();
     SystemClock_Config();
     MX_GPIO_Init();
@@ -198,29 +268,45 @@ int main(void) {
     MX_USART1_UART_Init();
 
     parser_reset(&g_parser);
-    HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET); // Modo RX
 
+    // inicia em RX (DE=/RE baixo)
+    HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
+
+    // habilita IDLE
     __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
-    HAL_UART_Receive_DMA(&huart1, rx_dma_buf, RX_DMA_BUF_SZ);
+
+    // inicia DMA no buffer ativo
+    rx_active_idx = 0;
+    HAL_UART_Receive_DMA(&huart1, rx_dma_buf[rx_active_idx], RX_DMA_BUF_SZ);
 
     while (1) {
+        // captura “pronta” de forma atômica
+        uint16_t n = 0;
+        uint8_t idx = 0;
+
+        __disable_irq();
         if (rx_dma_ready) {
+            rx_dma_ready = false;
+            n = rx_ready_len;
+            idx = rx_ready_idx;
+        }
+        __enable_irq();
+
+        if (n > 0) {
             frame_t fr;
-            for (uint16_t i = 0; i < rx_dma_len; i++) {
-                if (parser_feed(&g_parser, rx_dma_buf[i], &fr)) {
+            for (uint16_t i = 0; i < n; i++) {
+                if (parser_feed(&g_parser, rx_dma_buf[idx][i], &fr)) {
                     process_frame(&fr);
                 }
             }
-            rx_dma_ready = false;
-            HAL_UART_Receive_DMA(&huart1, rx_dma_buf, RX_DMA_BUF_SZ);
         }
     }
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
+/* =========================
+ *  CubeMX generated init functions (ajuste conforme seu projeto)
+ * ========================= */
+
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};

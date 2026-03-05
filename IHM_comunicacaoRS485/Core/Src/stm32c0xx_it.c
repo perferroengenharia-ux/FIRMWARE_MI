@@ -33,7 +33,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+extern UART_HandleTypeDef huart1;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -176,23 +176,27 @@ void DMA1_Channel1_IRQHandler(void)
   */
 void USART1_IRQHandler(void)
 {
-	/* Verifica se a interrupção foi por IDLE (linha ociosa) */
-	  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_IDLE))
-	  {
-	    __HAL_UART_CLEAR_IDLEFLAG(&huart1); // Limpa o flag obrigatoriamente
+  // IDLE detectado?
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_IDLE) != RESET) {
+    __HAL_UART_CLEAR_IDLEFLAG(&huart1);
 
-	    /* Calcula quantos bytes o DMA recebeu */
-	    uint16_t total_buffer = 256; // RX_DMA_BUF_SZ
-	    uint16_t remaining = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
-	    rx_dma_len = total_buffer - remaining;
+    // Para DMA e calcula quantos bytes chegaram no buffer ativo
+    HAL_UART_DMAStop(&huart1);
+    uint16_t remaining = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
+    uint16_t len = (uint16_t)(RX_DMA_BUF_SZ - remaining);
 
-	    /* Para o DMA para processamento seguro e sinaliza o main loop */
-	    HAL_UART_DMAStop(&huart1);
-	    rx_dma_ready = true;
-	  }
-	  HAL_UART_IRQHandler(&huart1);
+    // Publica buffer pronto
+    rx_ready_idx = rx_active_idx;
+    rx_ready_len = len;
+    rx_dma_ready = true;
+
+    // Alterna buffer e reinicia DMA no outro buffer
+    rx_active_idx ^= 1U;
+    HAL_UART_Receive_DMA(&huart1, rx_dma_buf[rx_active_idx], RX_DMA_BUF_SZ);
+  }
+
+  HAL_UART_IRQHandler(&huart1);
 }
-
 /* USER CODE BEGIN 1 */
 
 /* USER CODE END 1 */
