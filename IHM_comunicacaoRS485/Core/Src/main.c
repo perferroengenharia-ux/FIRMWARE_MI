@@ -2,13 +2,13 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : STM32 RS485 Slave (DMA+IDLE double-buffer) matching ESP32 Protocol
+  * @brief          : Módulo Inversor (MI) - STM32 RS485 Slave
+  * Processa comandos da IHM e retorna sensores.
   ******************************************************************************
   */
 /* USER CODE END Header */
 
 #include "main.h"
-#include "rs485_link.h"
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -20,14 +20,7 @@ typedef struct {
 } frame_t;
 
 typedef enum {
-    PS_WAIT_SOF = 0,
-    PS_HDR_ADDR,
-    PS_HDR_TYPE,
-    PS_HDR_SEQ,
-    PS_HDR_LEN,
-    PS_PAYLOAD,
-    PS_CRC_L,
-    PS_CRC_H
+    PS_WAIT_SOF = 0, PS_HDR_ADDR, PS_HDR_TYPE, PS_HDR_SEQ, PS_HDR_LEN, PS_PAYLOAD, PS_CRC_L, PS_CRC_H
 } parse_state_t;
 
 typedef struct {
@@ -39,6 +32,21 @@ typedef struct {
     uint8_t crc_l, crc_h;
 } frame_parser_t;
 
+/* --- Estruturas do Inversor --- */
+typedef struct {
+    uint8_t  buttons;      // Bit 0: Start, Bit 1: Stop, Bit 2: Reset
+    uint16_t target_freq;  // Frequência desejada
+    uint16_t ramp_time;    // Tempo de rampa
+    uint8_t  brake;        // Estado do freio
+} mi_commands_t;
+
+typedef struct {
+    uint16_t current_speed; // RPM
+    uint16_t motor_current; // mA
+    uint16_t bus_voltage;   // V
+    uint8_t  temp;          // °C
+} mi_sensors_t;
+
 /* Private define ------------------------------------------------------------*/
 #define SOF             0x7E
 #define ESC             0x7D
@@ -47,28 +55,34 @@ typedef struct {
 #define ADDR_STM32      0x01
 #define ADDR_MASTER     0xF0
 
-#define TYPE_PING       0x01
-#define TYPE_SET_PWM    0x03
 #define TYPE_READ_STATUS 0x04
 #define TYPE_ACK        0x80
 #define TYPE_NACK       0x81
 
 #define MAX_PAYLOAD     128
+#define RX_DMA_BUF_SZ   256
+
+/* Watchdog Config */
+#define COMMS_TIMEOUT_MS 2000
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
 
-/* ====== Double-buffer RX globals (visíveis no it.c) ====== */
+/* Double-buffer RX globals */
 uint8_t rx_dma_buf[2][RX_DMA_BUF_SZ];
 volatile uint16_t rx_ready_len = 0;
 volatile uint8_t  rx_ready_idx = 0;
 volatile bool     rx_dma_ready = false;
 volatile uint8_t  rx_active_idx = 0;
 
-/* Protocol state */
 static frame_parser_t g_parser;
-static uint8_t g_pwm_duty = 0;
+
+/* Variáveis de Aplicação */
+mi_commands_t g_cmd = {0};
+mi_sensors_t  g_sns = { .current_speed = 0, .motor_current = 0, .bus_voltage = 310, .temp = 35 };
+uint32_t last_packet_tick = 0;
+bool comms_ok = false;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -76,11 +90,11 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 
-/* =========================
- *  CRC16 (IBM / Modbus) poly 0xA001
- * ========================= */
-static uint16_t crc16_ibm(const uint8_t *data, uint16_t len)
-{
+/* ====================================================================
+ * PROTOCOLO & COMUNICAÇÃO
+ * ==================================================================== */
+
+static uint16_t crc16_ibm(const uint8_t *data, uint16_t len) {
     uint16_t crc = 0xFFFF;
     for (uint16_t i = 0; i < len; i++) {
         crc ^= data[i];
@@ -92,175 +106,115 @@ static uint16_t crc16_ibm(const uint8_t *data, uint16_t len)
     return crc;
 }
 
-static void parser_reset(frame_parser_t *p)
-{
-    p->st = PS_WAIT_SOF;
-    p->esc_next = false;
-    p->addr = p->type = p->seq = p->len = 0;
-    p->pay_i = 0;
-    p->crc_l = p->crc_h = 0;
+static void parser_reset(frame_parser_t *p) {
+    p->st = PS_WAIT_SOF; p->esc_next = false; p->pay_i = 0;
 }
 
-static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
-{
-    if (byte == SOF) {
-        p->st = PS_HDR_ADDR;
-        p->esc_next = false;
-        p->pay_i = 0;
-        return false;
-    }
-
+static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame) {
+    if (byte == SOF) { p->st = PS_HDR_ADDR; p->esc_next = false; p->pay_i = 0; return false; }
     if (p->st == PS_WAIT_SOF) return false;
-
-    if (p->esc_next) {
-        byte ^= ESC_XOR;
-        p->esc_next = false;
-    } else if (byte == ESC) {
-        p->esc_next = true;
-        return false;
-    }
+    if (p->esc_next) { byte ^= ESC_XOR; p->esc_next = false; }
+    else if (byte == ESC) { p->esc_next = true; return false; }
 
     switch (p->st) {
         case PS_HDR_ADDR: p->addr = byte; p->st = PS_HDR_TYPE; break;
         case PS_HDR_TYPE: p->type = byte; p->st = PS_HDR_SEQ; break;
         case PS_HDR_SEQ:  p->seq  = byte; p->st = PS_HDR_LEN; break;
-
         case PS_HDR_LEN:
             p->len = byte;
             if (p->len > MAX_PAYLOAD) { parser_reset(p); return false; }
-            p->pay_i = 0;
             p->st = (p->len == 0) ? PS_CRC_L : PS_PAYLOAD;
             break;
-
         case PS_PAYLOAD:
             p->payload[p->pay_i++] = byte;
             if (p->pay_i >= p->len) p->st = PS_CRC_L;
             break;
-
         case PS_CRC_L: p->crc_l = byte; p->st = PS_CRC_H; break;
-
         case PS_CRC_H: {
             p->crc_h = byte;
-
             uint8_t tmp[4 + MAX_PAYLOAD];
-            tmp[0] = p->addr;
-            tmp[1] = p->type;
-            tmp[2] = p->seq;
-            tmp[3] = p->len;
+            tmp[0] = p->addr; tmp[1] = p->type; tmp[2] = p->seq; tmp[3] = p->len;
             if (p->len) memcpy(&tmp[4], p->payload, p->len);
-
-            uint16_t calc   = crc16_ibm(tmp, (uint16_t)(4 + p->len));
+            uint16_t calc = crc16_ibm(tmp, 4 + p->len);
             uint16_t rx_crc = (uint16_t)p->crc_l | ((uint16_t)p->crc_h << 8);
-
             if (calc == rx_crc) {
-                out_frame->addr = p->addr;
-                out_frame->type = p->type;
-                out_frame->seq  = p->seq;
-                out_frame->len  = p->len;
+                out_frame->addr = p->addr; out_frame->type = p->type; out_frame->seq = p->seq; out_frame->len = p->len;
                 if (p->len) memcpy(out_frame->payload, p->payload, p->len);
-
-                parser_reset(p);
-                return true;
+                parser_reset(p); return true;
             }
-
             parser_reset(p);
-            return false;
         } break;
-
-        default:
-            parser_reset(p);
-            break;
+        default: parser_reset(p); break;
     }
-
     return false;
 }
 
-/* Escape + montagem do frame de reply com bounds */
-static void rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len)
-{
-    if (len > MAX_PAYLOAD) len = MAX_PAYLOAD;
-
-    uint8_t raw[1 + 4 + MAX_PAYLOAD + 2];
-    uint8_t esc[1 + 2*(4 + MAX_PAYLOAD + 2)];
+static void rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len) {
+    uint8_t raw[140], esc[280];
     uint16_t r_idx = 0, e_idx = 0;
-
     raw[r_idx++] = SOF;
     raw[r_idx++] = ADDR_MASTER;
     raw[r_idx++] = type;
     raw[r_idx++] = seq;
     raw[r_idx++] = len;
-
-    if (len && payload) {
-        memcpy(&raw[r_idx], payload, len);
-        r_idx += len;
-    }
-
-    uint16_t crc = crc16_ibm(&raw[1], (uint16_t)(r_idx - 1));
+    if (len && payload) { memcpy(&raw[r_idx], payload, len); r_idx += len; }
+    uint16_t crc = crc16_ibm(&raw[1], r_idx - 1);
     raw[r_idx++] = (uint8_t)(crc & 0xFF);
     raw[r_idx++] = (uint8_t)((crc >> 8) & 0xFF);
 
     esc[e_idx++] = SOF;
-
     for (uint16_t i = 1; i < r_idx; i++) {
-        if (e_idx + 2 >= sizeof(esc)) return; // bounds
         if (raw[i] == SOF || raw[i] == ESC) {
-            esc[e_idx++] = ESC;
-            esc[e_idx++] = (uint8_t)(raw[i] ^ ESC_XOR);
-        } else {
-            esc[e_idx++] = raw[i];
-        }
+            esc[e_idx++] = ESC; esc[e_idx++] = raw[i] ^ ESC_XOR;
+        } else esc[e_idx++] = raw[i];
     }
 
-    // guard time
-    for (volatile int i = 0; i < 12000; i++) { }
-
-    // TX enable
     HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_SET);
-    for (volatile int i = 0; i < 500; i++) { }
-    HAL_UART_Transmit(&huart1, esc, e_idx, 100);
-    while (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET) {}
-    HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
-
-    // RX enable
+    for(volatile int i=0; i<500; i++);
+    HAL_UART_Transmit(&huart1, esc, e_idx, 50);
+    while (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET);
     HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
 }
 
-static void process_frame(const frame_t *fr)
-{
+/* ====================================================================
+ * LÓGICA DA APLICAÇÃO (INVERSOR)
+ * ==================================================================== */
+
+static void process_frame(const frame_t *fr) {
     if (fr->addr != ADDR_STM32) return;
 
-    switch (fr->type) {
-        case TYPE_PING:
-            rs485_send_reply(TYPE_ACK, fr->seq, NULL, 0);
-            break;
+    // Reset do Watchdog
+    last_packet_tick = HAL_GetTick();
+    comms_ok = true;
 
-        case TYPE_SET_PWM:
-            if (fr->len >= 1) {
-                g_pwm_duty = fr->payload[0];
-                rs485_send_reply(TYPE_ACK, fr->seq, NULL, 0);
-            } else {
-                uint8_t err = 1;
-                rs485_send_reply(TYPE_NACK, fr->seq, &err, 1);
-            }
-            break;
+    if (fr->type == TYPE_READ_STATUS) {
+        // 1. Recebe 6 bytes da IHM (Comandos)
+        if (fr->len == 6) {
+            g_cmd.buttons     = fr->payload[0];
+            g_cmd.target_freq = (fr->payload[1] << 8) | fr->payload[2];
+            g_cmd.ramp_time   = (fr->payload[3] << 8) | fr->payload[4];
+            g_cmd.brake       = fr->payload[5];
 
-        case TYPE_READ_STATUS: {
-            uint8_t status[2] = { 1, g_pwm_duty };
-            rs485_send_reply(TYPE_ACK, fr->seq, status, 2);
-        } break;
+            // Aqui você processaria os botões (ex: bit 0 = Start)
+            if (g_cmd.buttons & 0x01) HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_SET);
+            else if (g_cmd.buttons & 0x02) HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_RESET);
+        }
 
-        default: {
-            uint8_t err = 2;
-            rs485_send_reply(TYPE_NACK, fr->seq, &err, 1);
-        } break;
+        // 2. Prepara 7 bytes de resposta (Sensores)
+        uint8_t resp[7];
+        resp[0] = (uint8_t)(g_sns.current_speed >> 8);
+        resp[1] = (uint8_t)(g_sns.current_speed & 0xFF);
+        resp[2] = (uint8_t)(g_sns.motor_current >> 8);
+        resp[3] = (uint8_t)(g_sns.motor_current & 0xFF);
+        resp[4] = (uint8_t)(g_sns.bus_voltage >> 8);
+        resp[5] = (uint8_t)(g_sns.bus_voltage & 0xFF);
+        resp[6] = g_sns.temp;
+
+        rs485_send_reply(TYPE_ACK, fr->seq, resp, 7);
     }
 }
 
-/* =========================
- *  Main
- * ========================= */
-int main(void)
-{
+int main(void) {
     HAL_Init();
     SystemClock_Config();
     MX_GPIO_Init();
@@ -268,19 +222,13 @@ int main(void)
     MX_USART1_UART_Init();
 
     parser_reset(&g_parser);
+    HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET); // Modo RX
 
-    // inicia em RX (DE=/RE baixo)
-    HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
-
-    // habilita IDLE
     __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
-
-    // inicia DMA no buffer ativo
-    rx_active_idx = 0;
     HAL_UART_Receive_DMA(&huart1, rx_dma_buf[rx_active_idx], RX_DMA_BUF_SZ);
 
     while (1) {
-        // captura “pronta” de forma atômica
+        // 1. Processa dados da UART (DMA/IDLE)
         uint16_t n = 0;
         uint8_t idx = 0;
 
@@ -300,12 +248,27 @@ int main(void)
                 }
             }
         }
+
+        // 2. Watchdog de Segurança
+        if (HAL_GetTick() - last_packet_tick > COMMS_TIMEOUT_MS) {
+            if (comms_ok) {
+                // FALHA: IHM desconectada. Desligar saídas do MI por segurança.
+                g_cmd.buttons = 0;
+                g_sns.current_speed = 0;
+                HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_RESET);
+                comms_ok = false;
+            }
+        }
+
+        // 3. Simulação de leitura de sensores (em produção viria do ADC/Encoder)
+        if (comms_ok) {
+            g_sns.motor_current = 1250; // 1.25A
+            // g_sns.current_speed aumentaria conforme rampa...
+        }
     }
 }
 
-/* =========================
- *  CubeMX generated init functions (ajuste conforme seu projeto)
- * ========================= */
+// ... MX_Init Functions (Clock, UART, DMA, GPIO) seguem o padrão CubeMX anterior
 
 void SystemClock_Config(void)
 {
