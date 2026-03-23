@@ -3,7 +3,7 @@
   ******************************************************************************
   * @file           : main.c
   * @brief          : Módulo Inversor (MI) - STM32 RS485 Slave
-  * Processa parâmetros P90, P91 e Erro E08.
+  * Suporta Handshake Inicial (0x05) e Operação (0x04)
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -13,10 +13,32 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Private typedef -----------------------------------------------------------*/
+/* ====================================================================
+ * DEFINIÇÕES DO PROTOCOLO RS485
+ * ==================================================================== */
+#define SOF              0x7E
+#define ESC              0x7D
+#define ESC_XOR          0x20
+
+#define ADDR_STM32       0x01
+#define ADDR_MASTER      0xF0
+
+/* Tipos de Frame */
+#define TYPE_READ_STATUS 0x04  // Loop normal de operação
+#define TYPE_WRITE_PARAM 0x05  // IHM enviando parâmetro (Handshake)
+#define TYPE_ACK_MI      0x06  // Resposta do MI para o Handshake
+#define TYPE_ACK         0x80  // Resposta do MI para Status
+
+#define MAX_PAYLOAD      128
+#define RX_DMA_BUF_SZ    256
+#define COMMS_TIMEOUT_MS 2000  // Timeout de segurança total (Watchdog)
+
+/* ====================================================================
+ * ESTRUTURAS DE DADOS
+ * ==================================================================== */
 typedef struct {
     uint8_t addr, type, seq, len;
-    uint8_t payload[128];
+    uint8_t payload[MAX_PAYLOAD];
 } frame_t;
 
 typedef enum {
@@ -26,63 +48,54 @@ typedef enum {
 typedef struct {
     parse_state_t st;
     bool esc_next;
-    uint8_t addr, type, seq, len, payload[128], pay_i, crc_l, crc_h;
+    uint8_t addr, type, seq, len, payload[MAX_PAYLOAD], pay_i, crc_l, crc_h;
 } frame_parser_t;
 
-/* --- Estruturas do Inversor --- */
+/* Estrutura de Parâmetros (Sincronizados via Handshake) */
 typedef struct {
-    uint8_t  buttons;      // Bit 0: Start, Bit 1: Stop, Bit 2: Reset P90
+    uint16_t p10_freq_min;
+    uint16_t p11_freq_max;
+    uint16_t p30_acel;
+    uint16_t p31_desacel;
+    uint8_t  p91_limit;
+} mi_settings_t;
+
+/* Comandos e Sensores */
+typedef struct {
+    uint8_t  buttons;
     uint16_t target_freq;
-    uint16_t ramp_time;
-    uint8_t  brake;
-    uint8_t  p90;          // Perdas atuais
-    uint8_t  p91;          // Tolerância
-    uint8_t  e08_active;   // Flag de Erro de Comunicação
+    uint8_t  e08_active;
 } mi_commands_t;
 
 typedef struct {
-    uint16_t current_speed; // RPM
-    uint16_t motor_current; // mA
-    uint16_t bus_voltage;   // V
-    uint8_t  temp;          // °C
+    uint16_t current_speed;
+    uint16_t motor_current;
+    uint16_t bus_voltage;
+    uint8_t  temp;
 } mi_sensors_t;
 
-/* Private define ------------------------------------------------------------*/
-#define SOF             0x7E
-#define ESC             0x7D
-#define ESC_XOR         0x20
-
-#define ADDR_STM32      0x01
-#define ADDR_MASTER     0xF0
-
-#define TYPE_READ_STATUS 0x04
-#define TYPE_ACK        0x80
-#define TYPE_NACK       0x81
-
-#define MAX_PAYLOAD     128
-#define RX_DMA_BUF_SZ   256
-
-/* Watchdog Hardware (Independente do E08) */
-#define COMMS_TIMEOUT_MS 2000
-
-/* Private variables ---------------------------------------------------------*/
+/* ====================================================================
+ * VARIÁVEIS GLOBAIS
+ * ==================================================================== */
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
 
-/* Double-buffer RX globals */
+/* Buffers DMA */
 uint8_t rx_dma_buf[2][RX_DMA_BUF_SZ];
 volatile uint16_t rx_ready_len = 0;
 volatile uint8_t  rx_ready_idx = 0;
 volatile bool     rx_dma_ready = false;
 volatile uint8_t  rx_active_idx = 0;
 
+/* Instâncias de Lógica */
 static frame_parser_t g_parser;
-
-/* Variáveis de Aplicação */
+mi_settings_t g_settings = {0};
 mi_commands_t g_cmd = {0};
-mi_sensors_t  g_sns = { .current_speed = 0, .motor_current = 0, .bus_voltage = 310, .temp = 35 };
+mi_sensors_t  g_sns = { .bus_voltage = 310, .temp = 35 };
+
 uint32_t last_packet_tick = 0;
 bool hardware_comms_ok = false;
+bool handshake_done = false; // Bloqueia motor até receber parâmetros iniciais
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -91,7 +104,7 @@ static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 
 /* ====================================================================
- * PROTOCOLO & COMUNICAÇÃO
+ * FUNÇÕES DE SUPORTE (CRC, PARSER, TX)
  * ==================================================================== */
 
 static uint16_t crc16_ibm(const uint8_t *data, uint16_t len) {
@@ -111,8 +124,9 @@ static void parser_reset(frame_parser_t *p) {
 }
 
 static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame) {
-    if (byte == SOF) { p->st = PS_HDR_ADDR; p->esc_next = false; p->pay_i = 0; return false; }
+    if (byte == SOF) { parser_reset(p); p->st = PS_HDR_ADDR; return false; }
     if (p->st == PS_WAIT_SOF) return false;
+
     if (p->esc_next) { byte ^= ESC_XOR; p->esc_next = false; }
     else if (byte == ESC) { p->esc_next = true; return false; }
 
@@ -151,14 +165,17 @@ static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame) {
 static void rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len) {
     uint8_t raw[140], esc[280];
     uint16_t r_idx = 0, e_idx = 0;
+
     raw[r_idx++] = SOF;
     raw[r_idx++] = ADDR_MASTER;
     raw[r_idx++] = type;
     raw[r_idx++] = seq;
     raw[r_idx++] = len;
     if (len && payload) { memcpy(&raw[r_idx], payload, len); r_idx += len; }
+
     uint16_t crc = crc16_ibm(&raw[1], r_idx - 1);
-    raw[r_idx++] = (uint8_t)(crc & 0xFF); raw[r_idx++] = (uint8_t)((crc >> 8) & 0xFF);
+    raw[r_idx++] = (uint8_t)(crc & 0xFF);
+    raw[r_idx++] = (uint8_t)((crc >> 8) & 0xFF);
 
     esc[e_idx++] = SOF;
     for (uint16_t i = 1; i < r_idx; i++) {
@@ -168,14 +185,13 @@ static void rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, 
     }
 
     HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_SET);
-    for(volatile int i=0; i<500; i++);
     HAL_UART_Transmit(&huart1, esc, e_idx, 50);
     while (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET);
     HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
 }
 
 /* ====================================================================
- * LÓGICA DA APLICAÇÃO (INVERSOR + ERRO E08)
+ * LÓGICA DE NEGÓCIO (HANDSHAKE & OPERAÇÃO)
  * ==================================================================== */
 
 static void process_frame(const frame_t *fr) {
@@ -184,42 +200,61 @@ static void process_frame(const frame_t *fr) {
     last_packet_tick = HAL_GetTick();
     hardware_comms_ok = true;
 
-    if (fr->type == TYPE_READ_STATUS) {
-        // 1. Recebe 9 bytes da IHM (Comandos + Diagnóstico)
-        if (fr->len == 9) {
-            g_cmd.buttons      = fr->payload[0];
-            g_cmd.target_freq  = (fr->payload[1] << 8) | fr->payload[2];
-            g_cmd.ramp_time    = (fr->payload[3] << 8) | fr->payload[4];
-            g_cmd.brake        = fr->payload[5];
-            g_cmd.p90          = fr->payload[6]; // Valor de perdas
-            g_cmd.p91          = fr->payload[7]; // Limite de perdas
-            g_cmd.e08_active   = fr->payload[8]; // Flag de Erro da IHM
+    switch (fr->type) {
 
-            /* INTERLOCK DE SEGURANÇA E08 */
-            if (g_cmd.e08_active) {
-                // MI bloqueado por excesso de falhas
-                HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_RESET);
-                g_sns.current_speed = 0; // Forçar parada simulada
-            } else {
-                // Operação Normal: Processa Botões Start/Stop
-                if (g_cmd.buttons & 0x01) HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_SET);
-                else if (g_cmd.buttons & 0x02) HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_RESET);
+        case TYPE_WRITE_PARAM: // 0x05 - Recebendo parâmetros da IHM
+            if (fr->len == 3) {
+                uint8_t  p_id = fr->payload[0];
+                uint16_t p_val = (fr->payload[1] << 8) | fr->payload[2];
+
+                // Mapeia IDs para variáveis internas
+                if (p_id == 10) g_settings.p10_freq_min = p_val;
+                else if (p_id == 11) g_settings.p11_freq_max = p_val;
+                else if (p_id == 30) g_settings.p30_acel     = p_val;
+                else if (p_id == 31) g_settings.p31_desacel  = p_val;
+                else if (p_id == 91) {
+                    g_settings.p91_limit = (uint8_t)p_val;
+                    handshake_done = true; // Consideramos sincronizado ao receber o último
+                }
+
+                // Envia Confirmação (ACK MI)
+                rs485_send_reply(TYPE_ACK_MI, fr->seq, NULL, 0);
             }
-        }
+            break;
 
-        // 2. Resposta de Sensores
-        uint8_t resp[7];
-        resp[0] = (uint8_t)(g_sns.current_speed >> 8);
-        resp[1] = (uint8_t)(g_sns.current_speed & 0xFF);
-        resp[2] = (uint8_t)(g_sns.motor_current >> 8);
-        resp[3] = (uint8_t)(g_sns.motor_current & 0xFF);
-        resp[4] = (uint8_t)(g_sns.bus_voltage >> 8);
-        resp[5] = (uint8_t)(g_sns.bus_voltage & 0xFF);
-        resp[6] = g_sns.temp;
+        case TYPE_READ_STATUS: // 0x04 - Loop de operação normal
+            if (fr->len == 9) {
+                g_cmd.buttons     = fr->payload[0];
+                g_cmd.target_freq = (fr->payload[1] << 8) | fr->payload[2];
+                g_cmd.e08_active  = fr->payload[8];
 
-        rs485_send_reply(TYPE_ACK, fr->seq, resp, 7);
+                /* Interlock de Segurança: Só opera se Handshake OK e Sem Erro E08 */
+                if (!g_cmd.e08_active && handshake_done) {
+                    if (g_cmd.buttons & 0x01) HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_SET);
+                    else if (g_cmd.buttons & 0x02) HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_RESET);
+                } else {
+                    HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_RESET);
+                }
+            }
+
+            /* Resposta com dados dos sensores */
+            uint8_t resp[7];
+            resp[0] = (uint8_t)(g_sns.current_speed >> 8);
+            resp[1] = (uint8_t)(g_sns.current_speed & 0xFF);
+            resp[2] = (uint8_t)(g_sns.motor_current >> 8);
+            resp[3] = (uint8_t)(g_sns.motor_current & 0xFF);
+            resp[4] = (uint8_t)(g_sns.bus_voltage >> 8);
+            resp[5] = (uint8_t)(g_sns.bus_voltage & 0xFF);
+            resp[6] = g_sns.temp;
+
+            rs485_send_reply(TYPE_ACK, fr->seq, resp, 7);
+            break;
     }
 }
+
+/* ====================================================================
+ * LOOP PRINCIPAL
+ * ==================================================================== */
 
 int main(void) {
     HAL_Init();
@@ -229,47 +264,55 @@ int main(void) {
     MX_USART1_UART_Init();
 
     parser_reset(&g_parser);
-    HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
 
+    /* Inicia UART com interrupção de IDLE e DMA */
     __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
     HAL_UART_Receive_DMA(&huart1, rx_dma_buf[rx_active_idx], RX_DMA_BUF_SZ);
 
     while (1) {
-    	if (HAL_GetTick() - last_packet_tick > 500) { // Se 500ms sem pacotes válidos
-    	    parser_reset(&g_parser); // Limpa o estado do protocolo
-    	    // Se o DMA travar por erro de Overrun (ruído), reinicia:
-    	    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)) {
-    	        __HAL_UART_CLEAR_FLAG(&huart1, UART_FLAG_ORE);
-    	        HAL_UART_Receive_DMA(&huart1, rx_dma_buf[rx_active_idx], RX_DMA_BUF_SZ);
-    	    }
-    	}
+        /* 1. Limpeza de Erros e Timeout de Barramento (Noise Recovery) */
+        if (HAL_GetTick() - last_packet_tick > 500) {
+            parser_reset(&g_parser);
+            if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)) {
+                __HAL_UART_CLEAR_FLAG(&huart1, UART_FLAG_ORE);
+                HAL_UART_Receive_DMA(&huart1, rx_dma_buf[rx_active_idx], RX_DMA_BUF_SZ);
+            }
+        }
 
-        // Processamento de RX
+        /* 2. Processamento dos dados recebidos via DMA */
         uint16_t n = 0;
         uint8_t idx = 0;
         __disable_irq();
-        if (rx_dma_ready) { rx_dma_ready = false; n = rx_ready_len; idx = rx_ready_idx; }
+        if (rx_dma_ready) {
+            rx_dma_ready = false;
+            n = rx_ready_len;
+            idx = rx_ready_idx;
+        }
         __enable_irq();
 
         if (n > 0) {
             frame_t fr;
             for (uint16_t i = 0; i < n; i++) {
-                if (parser_feed(&g_parser, rx_dma_buf[idx][i], &fr)) process_frame(&fr);
+                if (parser_feed(&g_parser, rx_dma_buf[idx][i], &fr)) {
+                    process_frame(&fr);
+                }
             }
         }
 
-        // Watchdog Físico (Timeout total de 2s sem qualquer sinal)
+        /* 3. Watchdog de Segurança (Desliga tudo se ficar 2 segundos sem rede) */
         if (HAL_GetTick() - last_packet_tick > COMMS_TIMEOUT_MS) {
-            if (hardware_comms_ok) {
-                HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_RESET);
-                hardware_comms_ok = false;
-            }
+            HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, GPIO_PIN_RESET);
+            hardware_comms_ok = false;
         }
 
-        // Sensores (Simulados)
-        if (hardware_comms_ok && !g_cmd.e08_active) {
-            g_sns.motor_current = 850;
-            g_sns.current_speed = g_cmd.target_freq * 30; // Ex: 60Hz -> 1800 RPM
+        /* 4. Simulação de Comportamento do Motor */
+        if (hardware_comms_ok && !g_cmd.e08_active && handshake_done) {
+            // Simula RPM proporcional à frequência (60Hz = 1800 RPM)
+            g_sns.current_speed = g_cmd.target_freq * 30;
+            g_sns.motor_current = 500 + (g_cmd.target_freq / 4);
+        } else {
+            g_sns.current_speed = 0;
+            g_sns.motor_current = 0;
         }
     }
 }
