@@ -53,11 +53,16 @@ typedef struct {
 
 /* Estrutura de Parâmetros (Sincronizados via Handshake) */
 typedef struct {
-    uint16_t p10_freq_min;
-    uint16_t p11_freq_max;
-    uint16_t p30_acel;
-    uint16_t p31_desacel;
-    uint8_t  p91_limit;
+    uint16_t p10_acel;
+    uint16_t p11_desacel;
+    uint16_t p20_freq_min;
+    uint16_t p21_freq_max;
+    uint16_t p35_torque;
+    uint16_t p42_igbt_khz;
+    uint16_t p43_i_motor;
+    uint8_t  p44_autoreset;
+    uint16_t p45_v_min;
+    uint8_t  p85_sensor_mode;
 } mi_settings_t;
 
 /* Comandos e Sensores */
@@ -80,6 +85,12 @@ typedef struct {
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
 
+/* Variáveis para simulação via Live Expressions */
+volatile uint16_t sim_rpm = 0;          // Rotações por minuto
+volatile uint16_t sim_corrente = 0;     // Corrente em mA (ex: 1500 = 1.5A)
+volatile uint16_t sim_tensao_bus = 220; // Tensão do Barramento DC
+volatile uint8_t  sim_temp = 35;        // Temperatura em Celsius
+
 /* Buffers DMA */
 uint8_t rx_dma_buf[2][RX_DMA_BUF_SZ];
 volatile uint16_t rx_ready_len = 0;
@@ -91,7 +102,7 @@ volatile uint8_t  rx_active_idx = 0;
 static frame_parser_t g_parser;
 mi_settings_t g_settings = {0};
 mi_commands_t g_cmd = {0};
-mi_sensors_t  g_sns = { .bus_voltage = 310, .temp = 35 };
+mi_sensors_t  g_sns = { .bus_voltage = 450, .temp = 45 };
 
 uint32_t last_packet_tick = 0;
 bool hardware_comms_ok = false;
@@ -202,25 +213,27 @@ static void process_frame(const frame_t *fr) {
 
     switch (fr->type) {
 
-        case TYPE_WRITE_PARAM: // 0x05 - Recebendo parâmetros da IHM
-            if (fr->len == 3) {
-                uint8_t  p_id = fr->payload[0];
-                uint16_t p_val = (fr->payload[1] << 8) | fr->payload[2];
+    case TYPE_WRITE_PARAM:
+        if (fr->len == 3) {
+            uint8_t  p_id = fr->payload[0];
+            uint16_t p_val = (fr->payload[1] << 8) | fr->payload[2];
 
-                // Mapeia IDs para variáveis internas
-                if (p_id == 10) g_settings.p10_freq_min = p_val;
-                else if (p_id == 11) g_settings.p11_freq_max = p_val;
-                else if (p_id == 30) g_settings.p30_acel     = p_val;
-                else if (p_id == 31) g_settings.p31_desacel  = p_val;
-                else if (p_id == 91) {
-                    g_settings.p91_limit = (uint8_t)p_val;
-                    handshake_done = true; // Consideramos sincronizado ao receber o último
-                }
-
-                // Envia Confirmação (ACK MI)
-                rs485_send_reply(TYPE_ACK_MI, fr->seq, NULL, 0);
+            if      (p_id == 10) g_settings.p10_acel      = p_val;
+            else if (p_id == 11) g_settings.p11_desacel   = p_val;
+            else if (p_id == 20) g_settings.p20_freq_min  = p_val;
+            else if (p_id == 21) g_settings.p21_freq_max  = p_val;
+            else if (p_id == 35) g_settings.p35_torque    = p_val;
+            else if (p_id == 42) g_settings.p42_igbt_khz  = p_val;
+            else if (p_id == 43) g_settings.p43_i_motor   = p_val;
+            else if (p_id == 44) g_settings.p44_autoreset = (uint8_t)p_val;
+            else if (p_id == 45) g_settings.p45_v_min     = p_val;
+            else if (p_id == 85) {
+                 g_settings.p85_sensor_mode = (uint8_t)p_val;
+                 handshake_done = true; // Liberamos o motor após o último parâmetro (P85)
             }
-            break;
+            rs485_send_reply(TYPE_ACK_MI, fr->seq, NULL, 0);
+        }
+        break;
 
         case TYPE_READ_STATUS: // 0x04 - Loop de operação normal
             if (fr->len == 9) {
@@ -239,13 +252,13 @@ static void process_frame(const frame_t *fr) {
 
             /* Resposta com dados dos sensores */
             uint8_t resp[7];
-            resp[0] = (uint8_t)(g_sns.current_speed >> 8);
-            resp[1] = (uint8_t)(g_sns.current_speed & 0xFF);
-            resp[2] = (uint8_t)(g_sns.motor_current >> 8);
-            resp[3] = (uint8_t)(g_sns.motor_current & 0xFF);
-            resp[4] = (uint8_t)(g_sns.bus_voltage >> 8);
-            resp[5] = (uint8_t)(g_sns.bus_voltage & 0xFF);
-            resp[6] = g_sns.temp;
+            resp[0] = (uint8_t)(sim_rpm >> 8);
+            resp[1] = (uint8_t)(sim_rpm & 0xFF);
+            resp[2] = (uint8_t)(sim_corrente >> 8);
+            resp[3] = (uint8_t)(sim_corrente & 0xFF);
+            resp[4] = (uint8_t)(sim_tensao_bus >> 8);
+            resp[5] = (uint8_t)(sim_tensao_bus & 0xFF);
+            resp[6] = sim_temp;
 
             rs485_send_reply(TYPE_ACK, fr->seq, resp, 7);
             break;
