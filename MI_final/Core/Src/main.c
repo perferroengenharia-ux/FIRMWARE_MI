@@ -132,6 +132,8 @@ typedef enum {
 #define RX_DMA_BUF_SZ            256
 #define COMMS_TIMEOUT_MS         2000U
 
+#define MI_STATUS_WATER_SHORTAGE (1u << 0)
+
 #define BTN_BIT_START            (1u << 0)
 #define BTN_BIT_STOP             (1u << 1)
 #define BTN_BIT_UP               (1u << 2)
@@ -313,6 +315,7 @@ static void process_frame(const frame_t *fr);
 static void comm_apply_received_command(void);
 static void comm_safe_stop(void);
 static void telemetry_update(void);
+static uint8_t telemetry_status_flags(void);
 static void atualiza_P42(void);
 static void load_flash_data(void);
 static void write_flash_data(void);
@@ -402,6 +405,8 @@ static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame) {
                 out_frame->seq = p->seq;
                 out_frame->len = p->len;
                 if (p->len) memcpy(out_frame->payload, p->payload, p->len);
+
+                dbg_crc_fail_count++;
 
                 parser_reset(p);
                 return true;
@@ -770,11 +775,11 @@ static void motor_init_runtime(void) {
     P21_run = P21;
 
     if (P42 <= 7u) P42 = 5u;
-    else if (P42 <= 12u) P42 = 5u; //10u
-    else P42 = 5u; //15u
+    else if (P42 <= 12u) P42 = 10u;
+    else P42 = 15u;
 
     last_P42 = 0u;
-    f_atual = (float)P20;
+    f_atual = 0.0f;
 
     peripherals_set_modes();
     motor_task_runtime();
@@ -823,8 +828,8 @@ static void motor_task_runtime(void) {
 
     if (P42 != last_P42) {
         if (P42 <= 7u) P42 = 5u;
-        else if (P42 <= 12u) P42 = 5u; //10u
-        else P42 = 5u; //15u
+        else if (P42 <= 12u) P42 = 10u;
+        else P42 = 15u;
         atualiza_P42();
         last_P42 = P42;
     }
@@ -880,6 +885,14 @@ static void motor_task_runtime(void) {
             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0u);
         }
     }
+}
+
+static uint8_t telemetry_status_flags(void) {
+    uint8_t flags = 0u;
+    if (P85 != 0u && sensor_estavel == 0u) {
+        flags |= MI_STATUS_WATER_SHORTAGE;
+    }
+    return flags;
 }
 
 static void telemetry_update(void) {
@@ -962,7 +975,7 @@ static void process_frame(const frame_t *fr) {
 
             telemetry_update();
             {
-                uint8_t resp[9];
+                uint8_t resp[10];
                 resp[0] = (uint8_t)(g_tel.current_freq_centi_hz >> 8);
                 resp[1] = (uint8_t)(g_tel.current_freq_centi_hz & 0xFFu);
                 resp[2] = (uint8_t)(g_tel.motor_current_ma >> 8);
@@ -972,7 +985,8 @@ static void process_frame(const frame_t *fr) {
                 resp[6] = (uint8_t)(g_tel.out_voltage_vrms >> 8);
                 resp[7] = (uint8_t)(g_tel.out_voltage_vrms & 0xFFu);
                 resp[8] = g_tel.temp_igbt_c;
-                rs485_send_reply(TYPE_ACK, fr->seq, resp, 9u);
+                resp[9] = telemetry_status_flags();
+                rs485_send_reply(TYPE_ACK, fr->seq, resp, 10u);
             }
             break;
 
@@ -1035,9 +1049,9 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
+  while(1)
   {
+  /* USER CODE BEGIN WHILE */
     if ((HAL_GetTick() - last_packet_tick) > 500u) {
         parser_reset(&g_parser);
         if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)) {
@@ -1048,35 +1062,37 @@ int main(void)
 
     uint16_t n = 0;
     uint8_t idx = 0;
-
     __disable_irq();
+
     if (rx_dma_ready) {
+
+    	if (n > 0u) {
+    	    dbg_main_rx_count++;
+    	    dbg_last_n = n;
+    	}
+
         rx_dma_ready = false;
         n = rx_ready_len;
         idx = rx_ready_idx;
-
-        if (n > 0u) {
-            dbg_main_rx_count++;
-            dbg_last_n = n;
-        }
     }
     __enable_irq();
 
     if (n > 0u) {
         frame_t fr;
         for (uint16_t i = 0; i < n; i++) {
-            if (parser_feed(&g_parser, rx_dma_buf[idx][i], &fr)) {
-                dbg_parser_ok_count++;
-                if (fr.type == TYPE_WRITE_PARAM) {
-                    dbg_type_write_param_count++;
-                }
-                process_frame(&fr);
-            }
+        	if (parser_feed(&g_parser, rx_dma_buf[idx][i], &fr)) {
+        	    dbg_parser_ok_count++;
+        	    if (fr.type == TYPE_WRITE_PARAM) {
+        	        dbg_type_write_param_count++;
+        	    }
+        	    process_frame(&fr);
+        	}
         }
     }
 
     if ((HAL_GetTick() - last_packet_tick) > COMMS_TIMEOUT_MS) {
         hardware_comms_ok = false;
+        handshake_done = handshake_done; /* mantém handshake já concluído */
         comm_safe_stop();
     }
 
@@ -1084,11 +1100,9 @@ int main(void)
     motor_task_runtime();
     telemetry_update();
 
-    HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin,
-                      hardware_comms_ok ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Led_GPIO_Port, Led_Pin, hardware_comms_ok ? GPIO_PIN_SET : GPIO_PIN_RESET);
 
     HAL_Delay(5);
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
