@@ -467,25 +467,31 @@ static void peripherals_set_modes(void) {
     ligar_motor_pin = GPIO_PIN_SET;
     desligar_motor_pin = GPIO_PIN_RESET;
 
+    /* BOMBA: P82=1 -> NA, P82=2 -> NF, P82=0 -> bloqueada logicamente */
     ligar_bomba    = (P82 == 2u) ? GPIO_PIN_RESET : GPIO_PIN_SET;
     desligar_bomba = (P82 == 2u) ? GPIO_PIN_SET   : GPIO_PIN_RESET;
 
-    ligar_swing    = (P81 == 2u) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-    desligar_swing = (P81 == 2u) ? GPIO_PIN_SET   : GPIO_PIN_RESET;
+    /* SWING: somente P81=1 habilita; o hardware fica em lógica normal. */
+    ligar_swing    = GPIO_PIN_SET;
+    desligar_swing = GPIO_PIN_RESET;
 
-    ligar_dreno    = (P80 == 2u) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-    desligar_dreno = (P80 == 2u) ? GPIO_PIN_SET   : GPIO_PIN_RESET;
+    /* P80 representa modo de dreno, não polaridade da saída. */
+    ligar_dreno    = GPIO_PIN_SET;
+    desligar_dreno = GPIO_PIN_RESET;
 }
 
 static uint8_t sensor_read(void) {
     if (P85 == 0u) {
+        /* Sensor desabilitado: sem confirmação de água, bloqueia climatização. */
         return 0u;
     }
 
     GPIO_PinState raw = HAL_GPIO_ReadPin(SENSOR_GPIO_Port, SENSOR_Pin);
     if (P85 == 1u) {
+        /* NA: nível alto indica água presente. */
         return (raw == GPIO_PIN_SET) ? 1u : 0u;
     }
+    /* P85 == 2 -> NF: nível baixo indica água presente. */
     return (raw == GPIO_PIN_RESET) ? 1u : 0u;
 }
 
@@ -538,9 +544,10 @@ static void comm_apply_received_command(void) {
 
 static void peripherals_apply_remote(void) {
     bool dreno_ativo = (remote_dreno_status != DRENO_IDLE) && (P80 != 0u);
+    bool sensor_ok = (P85 != 0u) && (sensor_estavel == 1u);
     bool permite_motor = hardware_comms_ok && handshake_done && !g_cmd.e08_active && remote_system_on && remote_start_latched && !dreno_ativo;
-    bool bomba_permitida = remote_system_on && remote_bomba_cmd && !remote_exaustao_cmd && !dreno_ativo && (P82 != 0u) && (sensor_estavel == 1u);
-    bool swing_permitido = remote_system_on && remote_swing_cmd && !dreno_ativo && (P81 != 0u);
+    bool bomba_permitida = remote_system_on && remote_bomba_cmd && !remote_exaustao_cmd && !dreno_ativo && (P82 != 0u) && sensor_ok;
+    bool swing_permitido = remote_system_on && remote_swing_cmd && !dreno_ativo && (P81 == 1u);
 
     if (!hardware_comms_ok || !handshake_done || g_cmd.e08_active) {
         dreno_ativo = false;
@@ -1049,9 +1056,9 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  while(1)
-  {
   /* USER CODE BEGIN WHILE */
+  while (1)
+  {
     if ((HAL_GetTick() - last_packet_tick) > 500u) {
         parser_reset(&g_parser);
         if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)) {
@@ -1063,36 +1070,32 @@ int main(void)
     uint16_t n = 0;
     uint8_t idx = 0;
     __disable_irq();
-
     if (rx_dma_ready) {
-
-    	if (n > 0u) {
-    	    dbg_main_rx_count++;
-    	    dbg_last_n = n;
-    	}
-
         rx_dma_ready = false;
         n = rx_ready_len;
         idx = rx_ready_idx;
+        if (n > 0u) {
+            dbg_main_rx_count++;
+            dbg_last_n = n;
+        }
     }
     __enable_irq();
 
     if (n > 0u) {
         frame_t fr;
         for (uint16_t i = 0; i < n; i++) {
-        	if (parser_feed(&g_parser, rx_dma_buf[idx][i], &fr)) {
-        	    dbg_parser_ok_count++;
-        	    if (fr.type == TYPE_WRITE_PARAM) {
-        	        dbg_type_write_param_count++;
-        	    }
-        	    process_frame(&fr);
-        	}
+            if (parser_feed(&g_parser, rx_dma_buf[idx][i], &fr)) {
+                dbg_parser_ok_count++;
+                if (fr.type == TYPE_WRITE_PARAM) {
+                    dbg_type_write_param_count++;
+                }
+                process_frame(&fr);
+            }
         }
     }
 
     if ((HAL_GetTick() - last_packet_tick) > COMMS_TIMEOUT_MS) {
         hardware_comms_ok = false;
-        handshake_done = handshake_done; /* mantém handshake já concluído */
         comm_safe_stop();
     }
 
@@ -1451,7 +1454,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM3)
   {
     spwm();
-    //calcula_rampa();
   }
   else if (htim->Instance == TIM14)
   {
