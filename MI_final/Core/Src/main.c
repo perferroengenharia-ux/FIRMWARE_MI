@@ -471,9 +471,17 @@ static void peripherals_set_modes(void) {
     ligar_bomba    = (P82 == 2u) ? GPIO_PIN_RESET : GPIO_PIN_SET;
     desligar_bomba = (P82 == 2u) ? GPIO_PIN_SET   : GPIO_PIN_RESET;
 
-    /* SWING: somente P81=1 habilita; o hardware fica em lógica normal. */
-    ligar_swing    = GPIO_PIN_SET;
-    desligar_swing = GPIO_PIN_RESET;
+    /* SWING: 0=desabilitado, 1=NA, 2=NF */
+    if (P81 == 0u) {
+        ligar_swing    = GPIO_PIN_RESET;
+        desligar_swing = GPIO_PIN_RESET;
+    } else if (P81 == 2u) {
+        ligar_swing    = GPIO_PIN_RESET;
+        desligar_swing = GPIO_PIN_SET;
+    } else {
+        ligar_swing    = GPIO_PIN_SET;
+        desligar_swing = GPIO_PIN_RESET;
+    }
 
     /* P80 representa modo de dreno, não polaridade da saída. */
     ligar_dreno    = GPIO_PIN_SET;
@@ -546,14 +554,16 @@ static void peripherals_apply_remote(void) {
     bool dreno_ativo = (remote_dreno_status != DRENO_IDLE) && (P80 != 0u);
     bool sensor_ok = (P85 != 0u) && (sensor_estavel == 1u);
     bool permite_motor = hardware_comms_ok && handshake_done && !g_cmd.e08_active && remote_system_on && remote_start_latched && !dreno_ativo;
+    bool motor_ativo = permite_motor || (f_atual > 0.1f);
     bool bomba_permitida = remote_system_on && remote_bomba_cmd && !remote_exaustao_cmd && !dreno_ativo && (P82 != 0u) && sensor_ok;
-    bool swing_permitido = remote_system_on && remote_swing_cmd && !dreno_ativo && (P81 == 1u);
+    bool swing_permitido = motor_ativo && remote_swing_cmd && !dreno_ativo && (P81 != 0u);
 
     if (!hardware_comms_ok || !handshake_done || g_cmd.e08_active) {
         dreno_ativo = false;
         bomba_permitida = false;
         swing_permitido = false;
         permite_motor = false;
+        motor_ativo = false;
     }
 
     if (dreno_ativo) {
@@ -789,6 +799,9 @@ static void motor_init_runtime(void) {
     f_atual = 0.0f;
 
     peripherals_set_modes();
+    sensor_ultimo_raw = sensor_read();
+    sensor_estavel = sensor_ultimo_raw;
+    sensor_delay_counter = 0;
     motor_task_runtime();
 }
 
@@ -956,6 +969,9 @@ static void process_frame(const frame_t *fr) {
                     case 85:
                         g_settings.p85_sensor_mode = (uint8_t)p_val;
                         P85 = (uint8_t)p_val;
+                        sensor_ultimo_raw = sensor_read();
+                        sensor_estavel = sensor_ultimo_raw;
+                        sensor_delay_counter = 0;
                         handshake_done = true;
                         break;
                     case 86: P86 = (uint8_t)p_val; break;
