@@ -948,6 +948,7 @@ static void process_frame(const frame_t *fr) {
                 uint16_t p_val = ((uint16_t)fr->payload[1] << 8) | fr->payload[2];
 
                 switch (p_id) {
+                    case 0:  P00 = (uint8_t)p_val; break;
                     case 10: g_settings.p10_acel = p_val; P10 = p_val; break;
                     case 11: g_settings.p11_desacel = p_val; P11 = p_val; break;
                     case 20: g_settings.p20_freq_min = p_val; P20 = (uint8_t)p_val; break;
