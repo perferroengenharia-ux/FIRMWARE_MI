@@ -556,7 +556,7 @@ static void peripherals_apply_remote(void) {
     bool permite_motor = hardware_comms_ok && handshake_done && !g_cmd.e08_active && remote_system_on && remote_start_latched && !dreno_ativo;
     bool motor_ativo = permite_motor || (f_atual > 0.1f);
     bool bomba_permitida = remote_system_on && remote_bomba_cmd && !remote_exaustao_cmd && !dreno_ativo && (P82 != 0u) && sensor_ok;
-    bool swing_permitido = motor_ativo && remote_swing_cmd && !dreno_ativo && (P81 != 0u);
+    bool swing_permitido = motor_ativo && remote_swing_cmd && !remote_exaustao_cmd && !dreno_ativo && (P81 != 0u);
 
     if (!hardware_comms_ok || !handshake_done || g_cmd.e08_active) {
         dreno_ativo = false;
@@ -813,12 +813,20 @@ static void motor_task_runtime(void) {
         } else if (P00 == 101u) {
             P10 = 15u; P11 = 5u; P12 = 1u;
             P20 = 1u;  P21 = 90u;
+            P30 = 10u; P31 = 5u; P32 = 30u; P33 = 0u;
             P35 = 0u;  P42 = 10u;
+            P43 = 5u;  P44 = 0u; P45 = 180u;
+            P51 = 0u;
+            P80 = 0u;  P81 = 1u; P82 = 1u; P83 = 10u; P84 = 5u; P85 = 1u; P86 = 1u;
             cmd_frequencia_alvo = 5.0f;
             params_locked = false;
             backup_P10 = P10; backup_P11 = P11; backup_P12 = P12;
             backup_P20 = P20; backup_P21 = P21;
             backup_P35 = P35; backup_P42 = P42;
+            peripherals_set_modes();
+            sensor_ultimo_raw = sensor_read();
+            sensor_estavel = sensor_ultimo_raw;
+            sensor_delay_counter = 0;
             write_flash_data();
         }
         P00 = 0u;
@@ -958,6 +966,7 @@ static void process_frame(const frame_t *fr) {
                     case 43: g_settings.p43_i_motor = p_val; P43 = (uint8_t)p_val; break;
                     case 44: g_settings.p44_autoreset = (uint8_t)p_val; P44 = (uint8_t)p_val; break;
                     case 45: g_settings.p45_v_min = p_val; P45 = p_val; break;
+                    case 51: P51 = (uint8_t)p_val; break;
                     case 30: P30 = p_val; break;
                     case 31: P31 = p_val; break;
                     case 32: P32 = (uint8_t)p_val; break;
