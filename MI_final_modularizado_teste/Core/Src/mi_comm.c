@@ -1,17 +1,23 @@
+#include "mi_config.h"
 #include "mi_comm.h"
-#include "mi_peripherals.h"
+#include "mi_state.h"
+#include "mi_platform.h"
+#include "mi_periph.h"
 #include "mi_motor.h"
-#include "mi_sensors.h"
 #include <string.h>
 
-static void mi_parser_reset(mi_frame_parser_t *p);
-static bool mi_parser_feed(mi_frame_parser_t *p, uint8_t byte, mi_frame_t *out_frame);
-static void mi_rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len);
-static void mi_process_frame(const mi_frame_t *fr);
+uint8_t rx_dma_buf[2][MI_RX_DMA_BUF_SZ];
+volatile uint16_t rx_ready_len = 0;
+volatile uint8_t  rx_ready_idx = 0;
+volatile bool     rx_dma_ready = false;
+volatile uint8_t  rx_active_idx = 0;
 
-uint16_t mi_crc16_ibm(const uint8_t *data, uint16_t len) {
-    uint16_t crc = 0xFFFF;
-    for (uint16_t i = 0; i < len; i++) {
+static mi_frame_parser_t g_parser;
+
+static uint16_t mi_crc16_ibm(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    for (uint16_t i = 0u; i < len; i++) {
         crc ^= data[i];
         for (int b = 0; b < 8; b++) {
             crc = (crc & 1u) ? (uint16_t)((crc >> 1) ^ 0xA001u) : (uint16_t)(crc >> 1);
@@ -20,19 +26,24 @@ uint16_t mi_crc16_ibm(const uint8_t *data, uint16_t len) {
     return crc;
 }
 
-static void mi_parser_reset(mi_frame_parser_t *p) {
+static void mi_parser_reset(mi_frame_parser_t *p)
+{
     p->st = MI_PS_WAIT_SOF;
     p->esc_next = false;
-    p->pay_i = 0;
+    p->pay_i = 0u;
 }
 
-static bool mi_parser_feed(mi_frame_parser_t *p, uint8_t byte, mi_frame_t *out_frame) {
+static bool mi_parser_feed(mi_frame_parser_t *p, uint8_t byte, mi_frame_t *out_frame)
+{
     if (byte == MI_SOF) {
         mi_parser_reset(p);
         p->st = MI_PS_HDR_ADDR;
         return false;
     }
-    if (p->st == MI_PS_WAIT_SOF) return false;
+
+    if (p->st == MI_PS_WAIT_SOF) {
+        return false;
+    }
 
     if (p->esc_next) {
         byte ^= MI_ESC_XOR;
@@ -43,9 +54,18 @@ static bool mi_parser_feed(mi_frame_parser_t *p, uint8_t byte, mi_frame_t *out_f
     }
 
     switch (p->st) {
-        case MI_PS_HDR_ADDR: p->addr = byte; p->st = MI_PS_HDR_TYPE; break;
-        case MI_PS_HDR_TYPE: p->type = byte; p->st = MI_PS_HDR_SEQ; break;
-        case MI_PS_HDR_SEQ:  p->seq  = byte; p->st = MI_PS_HDR_LEN; break;
+        case MI_PS_HDR_ADDR:
+            p->addr = byte;
+            p->st = MI_PS_HDR_TYPE;
+            break;
+        case MI_PS_HDR_TYPE:
+            p->type = byte;
+            p->st = MI_PS_HDR_SEQ;
+            break;
+        case MI_PS_HDR_SEQ:
+            p->seq = byte;
+            p->st = MI_PS_HDR_LEN;
+            break;
         case MI_PS_HDR_LEN:
             p->len = byte;
             if (p->len > MI_MAX_PAYLOAD) {
@@ -56,7 +76,9 @@ static bool mi_parser_feed(mi_frame_parser_t *p, uint8_t byte, mi_frame_t *out_f
             break;
         case MI_PS_PAYLOAD:
             p->payload[p->pay_i++] = byte;
-            if (p->pay_i >= p->len) p->st = MI_PS_CRC_L;
+            if (p->pay_i >= p->len) {
+                p->st = MI_PS_CRC_L;
+            }
             break;
         case MI_PS_CRC_L:
             p->crc_l = byte;
@@ -64,13 +86,16 @@ static bool mi_parser_feed(mi_frame_parser_t *p, uint8_t byte, mi_frame_t *out_f
             break;
         case MI_PS_CRC_H: {
             p->crc_h = byte;
-            uint8_t tmp[4 + MI_MAX_PAYLOAD];
+            uint8_t tmp[4u + MI_MAX_PAYLOAD];
             tmp[0] = p->addr;
             tmp[1] = p->type;
             tmp[2] = p->seq;
             tmp[3] = p->len;
-            if (p->len) memcpy(&tmp[4], p->payload, p->len);
-            uint16_t calc = mi_crc16_ibm(tmp, (uint16_t)(4 + p->len));
+            if (p->len != 0u) {
+                memcpy(&tmp[4], p->payload, p->len);
+            }
+
+            uint16_t calc = mi_crc16_ibm(tmp, (uint16_t)(4u + p->len));
             uint16_t recv = (uint16_t)p->crc_l | ((uint16_t)p->crc_h << 8);
 
             dbg_last_crc_calc = calc;
@@ -81,42 +106,53 @@ static bool mi_parser_feed(mi_frame_parser_t *p, uint8_t byte, mi_frame_t *out_f
                 out_frame->type = p->type;
                 out_frame->seq = p->seq;
                 out_frame->len = p->len;
-                if (p->len) memcpy(out_frame->payload, p->payload, p->len);
+                if (p->len != 0u) {
+                    memcpy(out_frame->payload, p->payload, p->len);
+                }
                 mi_parser_reset(p);
                 return true;
             }
+
             dbg_crc_fail_count++;
             mi_parser_reset(p);
-        } break;
+            break;
+        }
         default:
             mi_parser_reset(p);
             break;
     }
+
     return false;
 }
 
-static void mi_rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len) {
-    uint8_t raw[MI_MAX_PAYLOAD + 12];
-    uint8_t esc[(MI_MAX_PAYLOAD + 12) * 2u];
-    uint16_t r_idx = 0;
-    uint16_t e_idx = 0;
+static void mi_rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len)
+{
+    uint8_t raw[MI_MAX_PAYLOAD + 10u];
+    uint8_t esc[(MI_MAX_PAYLOAD + 10u) * 2u];
+    uint16_t r_idx = 0u;
+    uint16_t e_idx = 0u;
+
+    if (mi_huart == NULL) {
+        return;
+    }
 
     raw[r_idx++] = MI_SOF;
     raw[r_idx++] = MI_ADDR_MASTER;
     raw[r_idx++] = type;
     raw[r_idx++] = seq;
     raw[r_idx++] = len;
-    if (len && payload) {
+
+    if (len != 0u && payload != NULL) {
         memcpy(&raw[r_idx], payload, len);
         r_idx += len;
     }
 
-    uint16_t crc = mi_crc16_ibm(&raw[1], (uint16_t)(r_idx - 1));
+    uint16_t crc = mi_crc16_ibm(&raw[1], (uint16_t)(r_idx - 1u));
     raw[r_idx++] = (uint8_t)(crc & 0xFFu);
     raw[r_idx++] = (uint8_t)((crc >> 8) & 0xFFu);
 
     esc[e_idx++] = MI_SOF;
-    for (uint16_t i = 1; i < r_idx; i++) {
+    for (uint16_t i = 1u; i < r_idx; i++) {
         if (raw[i] == MI_SOF || raw[i] == MI_ESC) {
             esc[e_idx++] = MI_ESC;
             esc[e_idx++] = raw[i] ^ MI_ESC_XOR;
@@ -126,13 +162,98 @@ static void mi_rs485_send_reply(uint8_t type, uint8_t seq, const uint8_t *payloa
     }
 
     HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_SET);
-    HAL_UART_Transmit(&huart2, esc, e_idx, 50);
-    while (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_TC) == RESET) {}
+    HAL_UART_Transmit(mi_huart, esc, e_idx, 50u);
+    while (__HAL_UART_GET_FLAG(mi_huart, UART_FLAG_TC) == RESET) {}
     HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin, GPIO_PIN_RESET);
 }
 
-static void mi_process_frame(const mi_frame_t *fr) {
-    if (fr->addr != MI_ADDR_STM32) return;
+static uint8_t mi_telemetry_status_flags(void)
+{
+    uint8_t flags = 0u;
+    if (P85 != 0u && sensor_estavel == 0u) {
+        flags |= MI_STATUS_WATER_SHORTAGE;
+    }
+    return flags;
+}
+
+void mi_comm_apply_received_command(void)
+{
+    uint8_t btn = g_cmd.buttons;
+
+    if (btn & MI_BTN_BIT_START) remote_start_latched = true;
+    if (btn & MI_BTN_BIT_STOP)  remote_start_latched = false;
+
+    remote_system_on    = ((g_cmd.aux_flags & MI_AUX_BIT_SYSTEM_ON) != 0u);
+    remote_bomba_cmd    = ((g_cmd.aux_flags & MI_AUX_BIT_BOMBA) != 0u);
+    remote_swing_cmd    = ((g_cmd.aux_flags & MI_AUX_BIT_SWING) != 0u);
+    remote_exaustao_cmd = ((g_cmd.aux_flags & MI_AUX_BIT_EXAUSTAO) != 0u);
+    remote_dreno_status = (g_cmd.dreno_status == 0u) ? DRENO_IDLE :
+                          (g_cmd.dreno_status == 1u) ? DRENO_AGUARDANDO_LED : DRENO_EM_CURSO;
+
+    if (!remote_system_on) {
+        remote_start_latched = false;
+    }
+
+    P51 = (g_cmd.direction != 0u) ? 1u : 0u;
+    cmd_frequencia_alvo = ((float)g_cmd.target_freq_centi_hz) / 100.0f;
+}
+
+static void mi_telemetry_update(void)
+{
+    float f_hz = f_atual;
+    if (f_hz < 0.0f) f_hz = 0.0f;
+
+    g_tel.current_freq_centi_hz = (uint16_t)(f_hz * 100.0f + 0.5f);
+
+    if (cmd_ligar_motor || f_hz > 0.1f) {
+        uint16_t dynamic_vout = (uint16_t)((f_hz * (float)sim_v_out) / 60.0f);
+        g_tel.motor_current_ma =
+            (uint16_t)(g_analog.current_a_filt * 1000.0f + 0.5f);
+        g_tel.out_voltage_vrms = dynamic_vout;
+    } else {
+#if MI_CURRENT_BENCH_TEST_MODE
+        g_tel.motor_current_ma =
+            (uint16_t)(g_analog.current_a_filt * 1000.0f + 0.5f);
+#else
+        g_tel.motor_current_ma = 0u;
+#endif
+        g_tel.out_voltage_vrms = 0u;
+    }
+
+    g_tel.bus_voltage_vdc = (uint16_t)(g_analog.vbus_v_filt + 0.5f);
+    g_tel.temp_igbt_c = (uint8_t)(g_analog.temp_c_filt + 0.5f);
+}
+
+void mi_comm_send_ack_mi(uint8_t seq)
+{
+    mi_rs485_send_reply(MI_TYPE_ACK_MI, seq, NULL, 0u);
+}
+
+void mi_comm_send_status_reply(uint8_t seq)
+{
+    uint8_t resp[10];
+
+    mi_telemetry_update();
+
+    resp[0] = (uint8_t)(g_tel.current_freq_centi_hz >> 8);
+    resp[1] = (uint8_t)(g_tel.current_freq_centi_hz & 0xFFu);
+    resp[2] = (uint8_t)(g_tel.motor_current_ma >> 8);
+    resp[3] = (uint8_t)(g_tel.motor_current_ma & 0xFFu);
+    resp[4] = (uint8_t)(g_tel.bus_voltage_vdc >> 8);
+    resp[5] = (uint8_t)(g_tel.bus_voltage_vdc & 0xFFu);
+    resp[6] = (uint8_t)(g_tel.out_voltage_vrms >> 8);
+    resp[7] = (uint8_t)(g_tel.out_voltage_vrms & 0xFFu);
+    resp[8] = g_tel.temp_igbt_c;
+    resp[9] = mi_telemetry_status_flags();
+
+    mi_rs485_send_reply(MI_TYPE_ACK, seq, resp, 10u);
+}
+
+static void mi_process_frame(const mi_frame_t *fr)
+{
+    if (fr->addr != MI_ADDR_STM32) {
+        return;
+    }
 
     last_packet_tick = HAL_GetTick();
     hardware_comms_ok = true;
@@ -154,23 +275,30 @@ static void mi_process_frame(const mi_frame_t *fr) {
                     case 43: g_settings.p43_i_motor = p_val; P43 = (uint8_t)p_val; break;
                     case 44: g_settings.p44_autoreset = (uint8_t)p_val; P44 = (uint8_t)p_val; break;
                     case 45: g_settings.p45_v_min = p_val; P45 = p_val; break;
+                    case 51: P51 = (uint8_t)p_val; break;
                     case 30: P30 = p_val; break;
                     case 31: P31 = p_val; break;
                     case 32: P32 = (uint8_t)p_val; break;
                     case 33: P33 = (uint8_t)p_val; break;
-                    case 51: P51 = (uint8_t)p_val; break;
                     case 80: P80 = (uint8_t)p_val; break;
                     case 81: P81 = (uint8_t)p_val; break;
                     case 82: P82 = (uint8_t)p_val; break;
                     case 83: P83 = p_val; break;
                     case 84: P84 = p_val; break;
-                    case 85: g_settings.p85_sensor_mode = (uint8_t)p_val; P85 = (uint8_t)p_val; handshake_done = true; break;
+                    case 85:
+                        g_settings.p85_sensor_mode = (uint8_t)p_val;
+                        P85 = (uint8_t)p_val;
+                        sensor_ultimo_raw = mi_periph_sensor_read();
+                        sensor_estavel = sensor_ultimo_raw;
+                        sensor_delay_counter = 0u;
+                        handshake_done = true;
+                        break;
                     case 86: P86 = (uint8_t)p_val; break;
                     default: break;
                 }
 
                 mi_periph_set_modes();
-                mi_rs485_send_reply(MI_TYPE_ACK_MI, fr->seq, NULL, 0u);
+                mi_comm_send_ack_mi(fr->seq);
             }
             break;
 
@@ -186,22 +314,7 @@ static void mi_process_frame(const mi_frame_t *fr) {
                 g_cmd.e08_active = fr->payload[8];
                 mi_comm_apply_received_command();
             }
-
-            mi_telemetry_update();
-            {
-                uint8_t resp[10];
-                resp[0] = (uint8_t)(g_tel.current_freq_centi_hz >> 8);
-                resp[1] = (uint8_t)(g_tel.current_freq_centi_hz & 0xFFu);
-                resp[2] = (uint8_t)(g_tel.motor_current_ma >> 8);
-                resp[3] = (uint8_t)(g_tel.motor_current_ma & 0xFFu);
-                resp[4] = (uint8_t)(g_tel.bus_voltage_vdc >> 8);
-                resp[5] = (uint8_t)(g_tel.bus_voltage_vdc & 0xFFu);
-                resp[6] = (uint8_t)(g_tel.out_voltage_vrms >> 8);
-                resp[7] = (uint8_t)(g_tel.out_voltage_vrms & 0xFFu);
-                resp[8] = (uint8_t)(g_sensors.temp_c_filt + 0.5f);
-                resp[9] = g_tel.status_flags;
-                mi_rs485_send_reply(MI_TYPE_ACK, fr->seq, resp, 10u);
-            }
+            mi_comm_send_status_reply(fr->seq);
             break;
 
         default:
@@ -209,24 +322,56 @@ static void mi_process_frame(const mi_frame_t *fr) {
     }
 }
 
-void mi_comm_init(void) {
+void mi_comm_init(void)
+{
     mi_parser_reset(&g_parser);
-    __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
-    HAL_UART_Receive_DMA(&huart2, rx_dma_buf[rx_active_idx], MI_RX_DMA_BUF_SZ);
+}
+
+void mi_comm_start_rx(void)
+{
+    if (mi_huart == NULL) return;
+
+    rx_ready_len = 0u;
+    rx_ready_idx = 0u;
+    rx_dma_ready = false;
+    rx_active_idx = 0u;
+
+    __HAL_UART_ENABLE_IT(mi_huart, UART_IT_IDLE);
+    HAL_UART_Receive_DMA(mi_huart, rx_dma_buf[rx_active_idx], MI_RX_DMA_BUF_SZ);
     last_packet_tick = HAL_GetTick();
 }
 
-void mi_comm_process(void) {
-    if ((HAL_GetTick() - last_packet_tick) > 500u) {
-        mi_parser_reset(&g_parser);
-        if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE)) {
-            __HAL_UART_CLEAR_OREFLAG(&huart2);
-            HAL_UART_Receive_DMA(&huart2, rx_dma_buf[rx_active_idx], MI_RX_DMA_BUF_SZ);
-        }
+void mi_comm_uart_irq_handler(UART_HandleTypeDef *huart)
+{
+    if (mi_huart == NULL || huart != mi_huart) {
+        return;
     }
 
-    uint16_t n = 0;
-    uint8_t idx = 0;
+    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_IDLE) != RESET) {
+        __HAL_UART_CLEAR_IDLEFLAG(huart);
+
+        uint16_t n = 0u;
+        if (huart->hdmarx != NULL) {
+            n = (uint16_t)(MI_RX_DMA_BUF_SZ - __HAL_DMA_GET_COUNTER(huart->hdmarx));
+        }
+
+        HAL_UART_DMAStop(huart);
+
+        if (n > 0u && n <= MI_RX_DMA_BUF_SZ) {
+            rx_ready_len = n;
+            rx_ready_idx = rx_active_idx;
+            rx_dma_ready = true;
+            rx_active_idx ^= 1u;
+        }
+
+        HAL_UART_Receive_DMA(huart, rx_dma_buf[rx_active_idx], MI_RX_DMA_BUF_SZ);
+    }
+}
+
+void mi_comm_process_rx(void)
+{
+    uint16_t n = 0u;
+    uint8_t idx = 0u;
 
     __disable_irq();
     if (rx_dma_ready) {
@@ -242,7 +387,7 @@ void mi_comm_process(void) {
 
     if (n > 0u) {
         mi_frame_t fr;
-        for (uint16_t i = 0; i < n; i++) {
+        for (uint16_t i = 0u; i < n; i++) {
             if (mi_parser_feed(&g_parser, rx_dma_buf[idx][i], &fr)) {
                 dbg_parser_ok_count++;
                 if (fr.type == MI_TYPE_WRITE_PARAM) {

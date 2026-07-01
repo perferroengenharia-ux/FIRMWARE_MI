@@ -1,19 +1,13 @@
 #include "mi_state.h"
 
-mi_frame_parser_t g_parser = {0};
 mi_settings_t  g_settings = {0};
-mi_commands_t  g_cmd      = {0};
-mi_telemetry_t g_tel      = {0};
+mi_commands_t  g_cmd = {0};
+mi_telemetry_t g_tel = {0};
+mi_analog_t    g_analog = {0};
 
 uint32_t last_packet_tick = 0;
 bool hardware_comms_ok = false;
 bool handshake_done = false;
-
-uint8_t rx_dma_buf[2][MI_RX_DMA_BUF_SZ] = {{0}};
-volatile uint16_t rx_ready_len = 0;
-volatile uint8_t  rx_ready_idx = 0;
-volatile bool     rx_dma_ready = false;
-volatile uint8_t  rx_active_idx = 0;
 
 volatile uint32_t dbg_main_rx_count = 0;
 volatile uint32_t dbg_parser_ok_count = 0;
@@ -42,13 +36,6 @@ volatile float cmd_frequencia_alvo = 0.0f;
 volatile float f_atual = 0.0f;
 volatile uint32_t debug_isr_cnt = 0;
 
-volatile float ramp_inc_up = 0.0f;
-volatile float ramp_inc_down = 0.0f;
-volatile float inv_fs_2pi = 0.0f;
-volatile uint32_t current_arr = 99;
-volatile float amp_max_atual = 50.0f;
-volatile float freq_ISR = 10000.0f;
-
 uint32_t backup_P10 = 15;
 uint32_t backup_P11 = 5;
 uint8_t  backup_P12 = 1;
@@ -56,16 +43,25 @@ uint8_t  backup_P20 = 1;
 uint8_t  backup_P21 = 90;
 uint8_t  backup_P35 = 0;
 uint8_t  backup_P42 = 10;
+
 uint8_t  P20_run = 1;
 uint8_t  P21_run = 90;
 uint32_t P10_run = 15;
 uint32_t P11_run = 5;
 bool     last_motor_state = false;
 uint8_t  last_P42 = 0;
+
+volatile float ramp_inc_up = 0.0f;
+volatile float ramp_inc_down = 0.0f;
+volatile float inv_fs_2pi = 0.0f;
+volatile uint32_t current_arr = 99;
+volatile float amp_max_atual = 50.0f;
+volatile float freq_ISR = 10000.0f;
+
 float theta_u = 0.0f;
 float theta_v = 2.094395f;
 float theta_w = 4.188790f;
-const float MI_TWO_PI = 6.283185307f;
+const float TWO_PI = 6.283185307f;
 
 volatile uint32_t P30 = 0;
 volatile uint32_t P31 = 1;
@@ -85,7 +81,7 @@ bool remote_start_latched = false;
 bool remote_bomba_cmd = false;
 bool remote_swing_cmd = false;
 bool remote_exaustao_cmd = false;
-mi_dreno_state_t remote_dreno_status = MI_DRENO_IDLE;
+dreno_state_t remote_dreno_status = DRENO_IDLE;
 bool motor_reverse = false;
 
 uint32_t sensor_delay_counter = 0;
@@ -104,6 +100,33 @@ GPIO_PinState ligar_motor_pin = GPIO_PIN_SET;
 GPIO_PinState desligar_motor_pin = GPIO_PIN_RESET;
 
 volatile uint16_t sim_v_out = 220;
-volatile uint16_t sim_v_bus = 311;
-volatile uint16_t sim_i_out = 520;
-volatile uint8_t  sim_temp  = 32;
+
+float v_tso = 0.0f;
+float temp_c = 0.0f;
+float v_adc = 0.0f;
+float v_bus = 0.0f;
+
+bool current_filter_initialized = false;
+
+volatile uint32_t dbg_analog_call_count = 0;
+volatile uint32_t dbg_analog_ok_count = 0;
+volatile uint32_t dbg_analog_fail_count = 0;
+volatile uint32_t dbg_analog_last_call_ms = 0;
+volatile uint32_t dbg_analog_last_ok_ms = 0;
+volatile uint32_t dbg_adc_fail_stage = 0;
+volatile uint32_t dbg_adc_state_before = 0;
+volatile uint32_t dbg_adc_state_after = 0;
+volatile uint16_t dbg_adc_raw_current = 0;
+volatile uint16_t dbg_adc_raw_temp = 0;
+volatile uint16_t dbg_adc_raw_vbus = 0;
+
+volatile bool analog_update_request = false;
+volatile uint32_t tim16_100ms_count = 0;
+volatile uint32_t dbg_tim16_count = 0;
+
+float mi_clampf(float x, float lo, float hi)
+{
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
